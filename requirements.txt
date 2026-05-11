@@ -1,0 +1,18 @@
+# Kärn-MCP-bibliotek
+mcp>=1.0.0
+
+# HTTP-anrop mot Domstolsverkets API
+requests>=2.28.0
+
+# Miljökonfiguration
+python-dotenv>=1.0.0
+
+# PDF-extraktion (krävs av hamta_pdf)
+pymupdf4llm>=0.0.5
+
+# PostgreSQL-anslutning (krävs om DATABASE_URL pekar på PostgreSQL)
+psycopg2-binary>=2.9.6
+
+# HTTP-transport (krävs bara om MCP_TRANSPORT=http)
+starlette>=0.27.0
+uvicorn>=0.22.0
