@@ -817,11 +817,34 @@ async def _hamta_avgorande(id, inkludera_html=True, hamta_kompanjon=False):
     return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
 
+def _sakerstall_avgorande_cache(avgorande_id: str):
+    """
+    Säkerställer att metadata för ett avgörande finns i avgorande_cache.
+    Hämtar från API:et om cachen är tom eller utgången.
+    Anropas från hamta_pdf så att sok_i_domtext alltid kan returnera
+    domstolkod, avgorandedatum och benamning — även när hamta_avgorande
+    aldrig anropats direkt.
+    """
+    if not avgorande_id:
+        return
+    if _las_avgorande_cache(avgorande_id) is not None:
+        return
+    try:
+        a = _hamta_publicering_api(avgorande_id)
+        _skriv_avgorande_cache(a)
+        log.info("Metadata cachad för avgörande %s (via hamta_pdf)", avgorande_id)
+    except Exception as e:
+        log.warning("Kunde inte cacha metadata för avgörande %s: %s", avgorande_id, e)
+
+
 async def _hamta_pdf(fillagring_id, avgorande_id=None, filnamn=None):
     # Försök cache först
     cachad_text = _las_pdf_cache(fillagring_id)
     if cachad_text:
         log.info("hamta_pdf %s — returnerar från cache", fillagring_id)
+        # Retroaktiv metadata-fyllning: säkerställ att avgorande_cache är
+        # populerad även för PDF:er som cachades innan denna fix.
+        _sakerstall_avgorande_cache(avgorande_id)
         return [types.TextContent(type="text", text=cachad_text)]
 
     # Importera pymupdf4llm (lazy — krävs bara när PDF-hämtning sker)
@@ -870,6 +893,10 @@ async def _hamta_pdf(fillagring_id, avgorande_id=None, filnamn=None):
         filstorlek=len(pdf_bytes),
         filnamn=filnamn,
     )
+
+    # Säkerställ att metadata finns i avgorande_cache så att sok_i_domtext
+    # kan returnera domstolkod, avgorandedatum och benamning.
+    _sakerstall_avgorande_cache(avgorande_id)
 
     return [types.TextContent(type="text", text=markdown_text)]
 
