@@ -19,7 +19,8 @@ Varje avgörande innehåller maskinläsbara hänvisningar som möjliggör navige
 
 - `lagrumLista[].sfsNummer` — kopplar till lagstiftningen (SFSR-kompatibelt format)
 - `forarbeteLista` — kopplar till propositioner och utredningar (riksdagsformat)
-- `europarattsligaAvgorandenLista` — kopplar till EU-domstolens avgöranden (CELEX-nummer)
+- `europarattsligaAvgorandenLista` — binärt flaggfält: innehåller strängen `"Europarättsligt avgörande"` om avgörandet hänvisar till europarättsliga källor, annars tomt. Fältet anger **inte** vilka specifika mål som åsyftas — faktiska CELEX- och ECLI-nummer återfinns enbart i domtexten (HTML-fulltext) eller i `hanvisadePubliceringarLista` som fritext.
+- `hanvisadePubliceringarLista` — fritext med hänvisningar till andra avgöranden och källor, inklusive EU-domstolens CELEX-beteckningar (t.ex. `C-30/19, EU:C:2021:269`) och Europadomstolens målnummer (t.ex. `Application no. 44306/98`)
 
 ## Krav
 
