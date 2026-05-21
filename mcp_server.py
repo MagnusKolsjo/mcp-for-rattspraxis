@@ -18,9 +18,9 @@ import contextlib
 import json
 import logging
 import os
+import secrets
 import sys
 import urllib.parse
-from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import requests
@@ -28,6 +28,18 @@ from dotenv import load_dotenv
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp import types
+
+import db
+from db import (
+    DATABASE_URL as _DATABASE_URL,
+    _ar_postgres,
+    _hamta_db,
+    _sakerstall_schema,
+    _las_avgorande_cache,
+    _skriv_avgorande_cache,
+    _las_pdf_cache,
+    _skriv_pdf_cache,
+)
 
 # ---------------------------------------------------------------------------
 # Inledande inställningar
@@ -48,11 +60,16 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 _API_BAS = "https://rattspraxis.etjanst.domstol.se/api/v1"
+
+# Maximalt antal träffar per API-sida — API:et tillåter upp till 50.
+# Värdet är ett designval: 50 balanserar svarstid mot täckning vid paginering.
 _MAX_PER_SIDA = 50
 
-_DATABASE_URL = os.getenv("DATABASE_URL", "")
-_PDF_CACHE_TTL_DAGAR = int(os.getenv("PDF_CACHE_TTL_DAGAR", "90"))
-_METADATA_CACHE_TTL_DAGAR = int(os.getenv("METADATA_CACHE_TTL_DAGAR", "30"))
+# Projektidentifierande UA enligt projektets UA-konvention. Skickas med på
+# alla anrop mot Domstolsverkets rättspraxis-API.
+_HEADERS = {
+    "User-Agent": "mcp-for-rattspraxis/1.0 (+https://github.com/MagnusKolsjo/mcp-for-rattspraxis)",
+}
 
 # ---------------------------------------------------------------------------
 # Domstolsalias — hanterar historiska namnbyten
@@ -117,275 +134,13 @@ def _tysta_fd1():
 
 
 # ---------------------------------------------------------------------------
-# Databaslager
-# ---------------------------------------------------------------------------
-
-def _ar_postgres() -> bool:
-    """Returnerar True om DATABASE_URL pekar på PostgreSQL."""
-    return _DATABASE_URL.startswith("postgresql")
-
-
-def _hamta_db():
-    """Öppnar och returnerar en databasanslutning (PostgreSQL eller SQLite)."""
-    if _ar_postgres():
-        import psycopg2
-        return psycopg2.connect(_DATABASE_URL)
-    else:
-        import sqlite3
-        db_fil = _DATABASE_URL.replace("sqlite:///", "") or "rattspraxis_cache.db"
-        if not os.path.isabs(db_fil):
-            db_fil = str(_SCRIPT_DIR / db_fil)
-        return sqlite3.connect(db_fil)
-
-
-def _sakerstall_schema():
-    """
-    Skapar tabeller och index om de inte finns.
-    Körs vid serverstart.
-    """
-    try:
-        conn = _hamta_db()
-        cur = conn.cursor()
-
-        if _ar_postgres():
-            cur.execute("CREATE SCHEMA IF NOT EXISTS rattspraxis")
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS rattspraxis.avgorande_cache (
-                    id             TEXT PRIMARY KEY,
-                    domstolkod     TEXT,
-                    avgorandedatum DATE,
-                    ar_vagledande  BOOLEAN,
-                    benamning      TEXT,
-                    data           JSONB NOT NULL,
-                    hamtat         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    ttl_expires    TIMESTAMPTZ NOT NULL
-                )
-            """)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS avgorande_cache_domstol_idx
-                    ON rattspraxis.avgorande_cache (domstolkod)
-            """)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS avgorande_cache_datum_idx
-                    ON rattspraxis.avgorande_cache (avgorandedatum)
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS rattspraxis.pdf_cache (
-                    fillagring_id     TEXT PRIMARY KEY,
-                    avgorande_id      TEXT,
-                    text_md           TEXT NOT NULL,
-                    text_tsv          TSVECTOR
-                                        GENERATED ALWAYS AS
-                                        (to_tsvector('swedish', text_md)) STORED,
-                    hamtat            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    ttl_expires       TIMESTAMPTZ NOT NULL,
-                    filstorlek_bytes  INTEGER,
-                    filnamn           TEXT
-                )
-            """)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS pdf_cache_fts_idx
-                    ON rattspraxis.pdf_cache USING GIN (text_tsv)
-            """)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS pdf_cache_avgorande_idx
-                    ON rattspraxis.pdf_cache (avgorande_id)
-            """)
-        else:
-            # SQLite — enklare schema utan GENERATED ALWAYS och JSON
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS avgorande_cache (
-                    id             TEXT PRIMARY KEY,
-                    domstolkod     TEXT,
-                    avgorandedatum TEXT,
-                    ar_vagledande  INTEGER,
-                    benamning      TEXT,
-                    data           TEXT NOT NULL,
-                    hamtat         TEXT NOT NULL,
-                    ttl_expires    TEXT NOT NULL
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS pdf_cache (
-                    fillagring_id     TEXT PRIMARY KEY,
-                    avgorande_id      TEXT,
-                    text_md           TEXT NOT NULL,
-                    hamtat            TEXT NOT NULL,
-                    ttl_expires       TEXT NOT NULL,
-                    filstorlek_bytes  INTEGER,
-                    filnamn           TEXT
-                )
-            """)
-
-        conn.commit()
-        conn.close()
-        log.info("Databasschema verifierat")
-    except Exception as e:
-        log.warning("Kunde inte säkerställa databasschema: %s", e)
-
-
-def _nu_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _ttl_expires(dagar: int) -> datetime:
-    return _nu_utc() + timedelta(days=dagar)
-
-
-def _ar_giltig(ttl_expires_str: str) -> bool:
-    """Returnerar True om TTL-tidsstämpeln inte har passerat."""
-    try:
-        if isinstance(ttl_expires_str, datetime):
-            exp = ttl_expires_str
-            if exp.tzinfo is None:
-                exp = exp.replace(tzinfo=timezone.utc)
-            return exp > _nu_utc()
-        exp = datetime.fromisoformat(str(ttl_expires_str).replace("Z", "+00:00"))
-        if exp.tzinfo is None:
-            exp = exp.replace(tzinfo=timezone.utc)
-        return exp > _nu_utc()
-    except Exception:
-        return False
-
-
-# --- Avgorande-cache ---
-
-def _las_avgorande_cache(avgorande_id: str) -> dict | None:
-    """Hämtar ett cachat avgörande om det finns och inte har gått ut."""
-    try:
-        conn = _hamta_db()
-        cur = conn.cursor()
-        if _ar_postgres():
-            cur.execute(
-                "SELECT data, ttl_expires FROM rattspraxis.avgorande_cache WHERE id = %s",
-                (avgorande_id,)
-            )
-        else:
-            cur.execute(
-                "SELECT data, ttl_expires FROM avgorande_cache WHERE id = ?",
-                (avgorande_id,)
-            )
-        rad = cur.fetchone()
-        conn.close()
-        if rad and _ar_giltig(rad[1]):
-            data = rad[0]
-            return json.loads(data) if isinstance(data, str) else data
-    except Exception as e:
-        log.warning("Fel vid läsning av avgorande_cache: %s", e)
-    return None
-
-
-def _skriv_avgorande_cache(a: dict):
-    """Lagrar ett avgörande i cachen."""
-    try:
-        conn = _hamta_db()
-        cur = conn.cursor()
-        ttl = _ttl_expires(_METADATA_CACHE_TTL_DAGAR)
-        avgorande_id = a.get("id", "")
-        domstolkod = (a.get("domstol") or {}).get("domstolKod")
-        avgorandedatum = a.get("avgorandedatum")
-        ar_vagledande = a.get("arVagledande")
-        benamning = a.get("benamning")
-        nu = _nu_utc().isoformat()
-
-        if _ar_postgres():
-            cur.execute("""
-                INSERT INTO rattspraxis.avgorande_cache
-                    (id, domstolkod, avgorandedatum, ar_vagledande, benamning, data, hamtat, ttl_expires)
-                VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s)
-                ON CONFLICT (id) DO UPDATE SET
-                    data = EXCLUDED.data,
-                    hamtat = EXCLUDED.hamtat,
-                    ttl_expires = EXCLUDED.ttl_expires
-            """, (avgorande_id, domstolkod, avgorandedatum, ar_vagledande, benamning,
-                  json.dumps(a, ensure_ascii=False), nu, ttl.isoformat()))
-        else:
-            cur.execute("""
-                INSERT OR REPLACE INTO avgorande_cache
-                    (id, domstolkod, avgorandedatum, ar_vagledande, benamning, data, hamtat, ttl_expires)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (avgorande_id, domstolkod, avgorandedatum,
-                  1 if ar_vagledande else 0, benamning,
-                  json.dumps(a, ensure_ascii=False), nu, ttl.isoformat()))
-
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        log.warning("Fel vid skrivning till avgorande_cache: %s", e)
-
-
-# --- PDF-cache ---
-
-def _las_pdf_cache(fillagring_id: str) -> str | None:
-    """Hämtar cachad PDF-text om den finns och inte gått ut."""
-    try:
-        conn = _hamta_db()
-        cur = conn.cursor()
-        tabell = "rattspraxis.pdf_cache" if _ar_postgres() else "pdf_cache"
-        plats = "%s" if _ar_postgres() else "?"
-        cur.execute(
-            f"SELECT text_md, ttl_expires FROM {tabell} WHERE fillagring_id = {plats}",
-            (fillagring_id,)
-        )
-        rad = cur.fetchone()
-        conn.close()
-        if rad and _ar_giltig(rad[1]):
-            return rad[0]
-    except Exception as e:
-        log.warning("Fel vid läsning av pdf_cache: %s", e)
-    return None
-
-
-def _skriv_pdf_cache(
-    fillagring_id: str,
-    text_md: str,
-    avgorande_id: str = None,
-    filstorlek: int = None,
-    filnamn: str = None,
-):
-    """Lagrar extraherad PDF-text i cachen."""
-    try:
-        conn = _hamta_db()
-        cur = conn.cursor()
-        ttl = _ttl_expires(_PDF_CACHE_TTL_DAGAR)
-        nu = _nu_utc().isoformat()
-
-        if _ar_postgres():
-            cur.execute("""
-                INSERT INTO rattspraxis.pdf_cache
-                    (fillagring_id, avgorande_id, text_md, hamtat, ttl_expires,
-                     filstorlek_bytes, filnamn)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (fillagring_id) DO UPDATE SET
-                    text_md = EXCLUDED.text_md,
-                    hamtat = EXCLUDED.hamtat,
-                    ttl_expires = EXCLUDED.ttl_expires
-            """, (fillagring_id, avgorande_id, text_md, nu, ttl.isoformat(),
-                  filstorlek, filnamn))
-        else:
-            cur.execute("""
-                INSERT OR REPLACE INTO pdf_cache
-                    (fillagring_id, avgorande_id, text_md, hamtat, ttl_expires,
-                     filstorlek_bytes, filnamn)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (fillagring_id, avgorande_id, text_md, nu, ttl.isoformat(),
-                  filstorlek, filnamn))
-
-        conn.commit()
-        conn.close()
-        log.info("PDF-text cachad: %s (%d tecken)", fillagring_id, len(text_md))
-    except Exception as e:
-        log.warning("Fel vid skrivning till pdf_cache: %s", e)
-
-
-# ---------------------------------------------------------------------------
 # HTTP-hjälpfunktioner mot Domstolsverkets API
 # ---------------------------------------------------------------------------
 
 def _sok_post(body: dict) -> dict:
     """Anropar POST /api/v1/sok och returnerar svaret som dict."""
     url = f"{_API_BAS}/sok"
-    r = requests.post(url, json=body, timeout=15)
+    r = requests.post(url, json=body, headers=_HEADERS, timeout=15)
     r.raise_for_status()
     return r.json()
 
@@ -393,7 +148,7 @@ def _sok_post(body: dict) -> dict:
 def _hamta_publicering_api(avgorande_id: str) -> dict:
     """GET /api/v1/publiceringar/{id} — returnerar fullständigt avgörande."""
     url = f"{_API_BAS}/publiceringar/{avgorande_id}"
-    r = requests.get(url, timeout=15)
+    r = requests.get(url, headers=_HEADERS, timeout=15)
     r.raise_for_status()
     return r.json()
 
@@ -404,7 +159,7 @@ def _hamta_publicering_api(avgorande_id: str) -> dict:
 
 def _hamta_grupp_kompanjon(avgorande: dict) -> dict | None:
     """
-    Slår upp syskonpublikation via benamning-exaktsökning.
+    Slår upp syskonpublication via benamning-exaktsökning.
 
     gruppKorrelationsnummer grupperar två varianter av samma avgörande:
       DOM_ELLER_BESLUT — publiceras direkt, saknar NJA-nummer
@@ -451,6 +206,7 @@ def _formatera_avgorande(a: dict, inkludera_innehall: bool = False) -> dict:
         "domstol": (a.get("domstol") or {}).get("domstolNamn"),
         "domstolkod": (a.get("domstol") or {}).get("domstolKod"),
         "avgorandedatum": a.get("avgorandedatum"),
+        "publiceringstid": a.get("publiceringstid"),
         "ar_vagledande": a.get("arVagledande"),
         "benamning": a.get("benamning"),
         "sammanfattning": a.get("sammanfattning"),
@@ -462,6 +218,8 @@ def _formatera_avgorande(a: dict, inkludera_innehall: bool = False) -> dict:
         "forarbeten": a.get("forarbeteLista", []),
         "eu_avgoranden": a.get("europarattsligaAvgorandenLista", []),
         "hanvisade": a.get("hanvisadePubliceringarLista", []),
+        "litteratur": a.get("litteraturLista", []),
+        "ecli_nummer": a.get("ecliNummer"),
         "grupp_id": a.get("gruppKorrelationsnummer"),
         "har_html_fulltext": har_innehall,
         "bilagor": [
@@ -562,9 +320,9 @@ async def lista_verktyg() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "id": {
+                    "avgorande_id": {
                         "type": "string",
-                        "description": "Avgörandets UUID (id-fältet från sok_rattpraxis)",
+                        "description": "Avgörandets UUID (avgorande_id från sok_rattpraxis)",
                     },
                     "inkludera_html": {
                         "type": "boolean",
@@ -578,7 +336,7 @@ async def lista_verktyg() -> list[types.Tool]:
                         ),
                     },
                 },
-                "required": ["id"],
+                "required": ["avgorande_id"],
             },
         ),
         types.Tool(
@@ -736,7 +494,7 @@ async def anropa_verktyg(
 
 
 # ---------------------------------------------------------------------------
-# Verktygsiimplementationer
+# Verktygsimplementationer
 # ---------------------------------------------------------------------------
 
 async def _sok_rattpraxis(
@@ -797,17 +555,17 @@ async def _sok_rattpraxis(
     return [types.TextContent(type="text", text=json.dumps(resultat, ensure_ascii=False, indent=2))]
 
 
-async def _hamta_avgorande(id, inkludera_html=True, hamta_kompanjon=False):
+async def _hamta_avgorande(avgorande_id, inkludera_html=True, hamta_kompanjon=False):
     # Försök cache först
-    a = _las_avgorande_cache(id)
+    a = _las_avgorande_cache(avgorande_id)
     kalla = "cache"
 
     if a is None:
-        a = _hamta_publicering_api(id)
+        a = _hamta_publicering_api(avgorande_id)
         _skriv_avgorande_cache(a)
         kalla = "api"
 
-    log.info("hamta_avgorande %s — källa: %s", id, kalla)
+    log.info("hamta_avgorande %s — källa: %s", avgorande_id, kalla)
     result = _formatera_avgorande(a, inkludera_innehall=bool(inkludera_html))
 
     if hamta_kompanjon:
@@ -867,7 +625,7 @@ async def _hamta_pdf(fillagring_id, avgorande_id=None, filnamn=None):
     log.info("Hämtar PDF: %s", url)
 
     try:
-        resp = requests.get(url, headers={"Accept": "application/octet-stream"}, timeout=30)
+        resp = requests.get(url, headers={**_HEADERS, "Accept": "application/octet-stream"}, timeout=30)
         resp.raise_for_status()
         pdf_bytes = resp.content
     except requests.RequestException as e:
@@ -946,7 +704,12 @@ async def _sok_rattpraxis_for_lagrum(
         if para_filter:
             for a in treffar:
                 for lagrum in a.get("lagrumLista", []):
-                    if para_filter in (lagrum.get("referens") or "").lower():
+                    # Kontrollera att paragrafen tillhör rätt SFS-nummer, inte
+                    # ett annat lagrum i samma avgörande med liknande paragrafbeteckning.
+                    if (
+                        para_filter in (lagrum.get("referens") or "").lower()
+                        and lagrum.get("sfsNummer") == sfs_nummer
+                    ):
                         alla.append(a)
                         break
         else:
@@ -983,7 +746,7 @@ async def _hamta_avgorande_pa_beteckning(beteckning, hamta_kompanjon=True):
     data = _sok_post(body)
     treffar = data.get("publiceringLista", [])
 
-    # Steg 2: AND-sökning som fallback
+    # Steg 2: AND-sökning som reservväg
     if not treffar:
         ord_lista = [w for w in beteckning.replace('"', "").split() if len(w) > 2]
         if ord_lista:
@@ -1172,42 +935,78 @@ async def _kora_stdio():
 
 
 def _starta_http():
+    """
+    Startar HTTP-transport via StreamableHTTP-protokollet med valfri
+    Bearer-token-autentisering.
+
+    Servern lyssnar på /mcp och hanterar sessioner via
+    StreamableHTTPSessionManager. Lifespan-kontexthanteraren säkerställer
+    att session manager startas och stängs ned korrekt med Starlette.
+    """
     from starlette.applications import Starlette
+    from starlette.middleware import Middleware
     from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.requests import Request
-    from starlette.responses import Response
-    from mcp.server.sse import SseServerTransport
+    from starlette.responses import PlainTextResponse
+    from starlette.routing import Mount
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
     import uvicorn
 
     api_nyckel = os.getenv("MCP_API_KEY", "")
     host = os.getenv("MCP_HOST", "127.0.0.1")
     port = int(os.getenv("MCP_PORT", "8005"))
 
-    class BearerKontroll(BaseHTTPMiddleware):
-        async def dispatch(self, request: Request, call_next):
-            if api_nyckel:
-                auth = request.headers.get("Authorization", "")
-                if not auth.startswith("Bearer ") or auth[7:] != api_nyckel:
-                    return Response("Otillåten åtkomst", status_code=401)
-            return await call_next(request)
+    session_manager = StreamableHTTPSessionManager(server)
 
-    sse = SseServerTransport("/messages/")
+    @contextlib.asynccontextmanager
+    async def lifespan(app):
+        async with session_manager.run():
+            yield
 
-    async def hantera_sse(scope, receive, send):
-        async with sse.connect_sse(scope, receive, send) as streams:
-            await server.run(streams[0], streams[1], server.create_initialization_options())
+    async def hantera_mcp(scope, receive, send):
+        await session_manager.handle_request(scope, receive, send)
 
-    app = Starlette(routes=[])
-    app.add_middleware(BearerKontroll)
-    app.add_route("/sse", hantera_sse)
-    app.mount("/messages/", sse.handle_post_message)
+    middleware_lista = []
+    if api_nyckel:
+        log.info("API-nyckelautentisering aktiverad")
 
-    log.info("Startar HTTP-server på %s:%s", host, port)
-    uvicorn.run(app, host=host, port=port)
+        class BearerKontroll(BaseHTTPMiddleware):
+            async def dispatch(self, request, call_next):
+                token = (
+                    request.headers.get("Authorization", "")
+                    .removeprefix("Bearer ")
+                    .strip()
+                )
+                # secrets.compare_digest ger konstant-tidsjämförelse (skyddar mot timing-attack).
+                if not secrets.compare_digest(token, api_nyckel):
+                    return PlainTextResponse(
+                        "Obehörig: ogiltig eller saknad API-nyckel.", status_code=401
+                    )
+                return await call_next(request)
+
+        middleware_lista = [Middleware(BearerKontroll)]
+    else:
+        log.warning(
+            "MCP_API_KEY är inte satt — servern körs utan autentisering. "
+            "Bind enbart till loopback (MCP_HOST=127.0.0.1) eller "
+            "skydda via reverse proxy."
+        )
+
+    app = Starlette(
+        lifespan=lifespan,
+        routes=[Mount("/mcp", app=hantera_mcp)],
+        middleware=middleware_lista,
+    )
+
+    log.info("Startar HTTP-transport på %s:%s", host, port)
+    uvicorn.run(app, host=host, port=port, log_level="info")
 
 
 def main():
-    _sakerstall_schema()
+    try:
+        _sakerstall_schema()
+    except Exception as e:
+        log.warning("Schema-init misslyckades (%s) — servern startar ändå.", e)
+
     transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
     if transport == "stdio":
         log.info("Startar rattspraxis MCP-server (stdio)")

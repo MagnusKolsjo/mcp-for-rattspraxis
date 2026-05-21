@@ -11,7 +11,11 @@ Servern exponerar sex verktyg:
 - **hamta_pdf** — hämtar och extraherar text ur PDF-bilaga (nödvändigt för HD och MÖD som saknar HTML-fulltext); extraherad text cachas lokalt
 - **sok_rattpraxis_for_lagrum** — söker praxis kopplad till en specifik paragraf i en lag, t.ex. alla HD-domar om 36 § avtalslagen
 - **hamta_avgorande_pa_beteckning** — söker på NJA-nummer (NJA 2025:67), HFD-referat (HFD 2026 ref. 1), HD:s kortnamn eller målnummer
-- **sok_i_domtext** — söker fulltext inuti cachade domtexter; kräver PostgreSQL för avancerad FTS med relevansrankning och kontextutdrag
+- **sok_i_domtext** — söker fulltext inuti cachade domtexter; PostgreSQL ger avancerad FTS med relevansrankning och kontextutdrag, SQLite ger enklare LIKE-sökning
+
+### Arkitektur: cache på begäran
+
+Servern laddar inga avgöranden i förväg. Metadata och PDF-texter hämtas från Domstolsverkets API vid det första anropet och lagras sedan i databasen med konfigurerbar TTL. Sökning med `sok_i_domtext` täcker därför bara avgöranden som redan hämtats via `hamta_avgorande` eller `hamta_pdf` i tidigare sessioner.
 
 ### Korsreferenser i rättskedjan
 
@@ -19,13 +23,13 @@ Varje avgörande innehåller maskinläsbara hänvisningar som möjliggör navige
 
 - `lagrumLista[].sfsNummer` — kopplar till lagstiftningen (SFSR-kompatibelt format)
 - `forarbeteLista` — kopplar till propositioner och utredningar (riksdagsformat)
-- `europarattsligaAvgorandenLista` — binärt flaggfält: innehåller strängen `"Europarättsligt avgörande"` om avgörandet hänvisar till europarättsliga källor, annars tomt. Fältet anger **inte** vilka specifika mål som åsyftas — faktiska CELEX- och ECLI-nummer återfinns enbart i domtexten (HTML-fulltext) eller i `hanvisadePubliceringarLista` som fritext.
+- `europarattsligaAvgorandenLista` — lista med strängar som beskriver typen av europarättslig koppling: `"Europarättsligt avgörande"` och/eller `"Mänskliga rättigheter"`. Tom lista om ingen europarättslig koppling finns. Faktiska CELEX- och ECLI-nummer återfinns enbart i domtexten (HTML-fulltext) eller i `hanvisadePubliceringarLista` som fritext.
 - `hanvisadePubliceringarLista` — fritext med hänvisningar till andra avgöranden och källor, inklusive EU-domstolens CELEX-beteckningar (t.ex. `C-30/19, EU:C:2021:269`) och Europadomstolens målnummer (t.ex. `Application no. 44306/98`)
 
 ## Krav
 
 - Python 3.11 eller senare
-- PostgreSQL (rekommenderas för `sok_i_domtext` med fulltext-sökning) eller SQLite (fallback med enklare LIKE-sökning)
+- PostgreSQL (för `sok_i_domtext` med fulltext-sökning) eller SQLite (med enklare LIKE-sökning)
 - Internetanslutning mot `https://rattspraxis.etjanst.domstol.se`
 
 ## Installation
@@ -53,7 +57,7 @@ Lägg till följande block i konfigurationsfilen för ditt AI-verktyg:
 }
 ```
 
-## Databasskema
+## Databasschema
 
 Servern skapar automatiskt schemat `rattspraxis` i din PostgreSQL-databas (eller tabellerna direkt om SQLite används) vid första uppstarten:
 
