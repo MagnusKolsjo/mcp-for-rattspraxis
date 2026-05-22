@@ -5,6 +5,12 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.1] — 2026-05-22
+
+### Åtgärdat
+
+- `.DS_Store` borttagen ur git-historiken; `.gitignore` uppdaterad
+
 ## [1.1.0] — 2026-05-22
 
 ### Tillagt
