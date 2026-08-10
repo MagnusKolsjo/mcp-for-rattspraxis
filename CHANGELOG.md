@@ -3,7 +3,26 @@
 Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.2.0] — 2026-08-10
+
+### Tillagt
+
+- **`max_tecken` och `fran_tecken` i `hamta_pdf`.** Verktyget returnerade hela den
+  extraherade domtexten utan möjlighet att begränsa, vilket för långa avgöranden
+  riskerade att överskrida MCP-protokollets storleksgräns per svar utan väg runt.
+  Ett kapat svar avslutas med en rad i klartext:
+  `[Visar tecken 1–246 av 6 360. Läs vidare: hamta_pdf(fillagring_id="…", fran_tecken=250)]`.
+  Kapningen sker på ord- eller radgräns, aldrig mitt i ett ord.
+
+  PDF-cachen lagrar fortfarande hela texten — trunkeringen gäller bara svaret till
+  anroparen, så `sok_i_domtext` påverkas inte.
+
+### Bakgrund
+
+Genomför projektets svarskontrakt (`00-las-forst.md` → "Svarskontraktet — storlek,
+trunkering, adressering och sökning"). Additiva parametrar — inga brytande ändringar.
+Att en dom kan kapas utan att det syns är särskilt allvarligt i den här strömmen,
+eftersom domskäl citeras ordagrant.
 
 ## [1.1.1] — 2026-05-22
 

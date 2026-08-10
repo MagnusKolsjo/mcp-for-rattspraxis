@@ -8,7 +8,7 @@ Servern exponerar sex verktyg:
 
 - **sok_rattpraxis** — söker i hela rättspraxis-databasen med filter på domstol, datum, SFS-nummer och rättsområde
 - **hamta_avgorande** — hämtar ett fullständigt avgörande med metadata, lagrum, förarbeteshänvisningar och EU-rättshänvisningar
-- **hamta_pdf** — hämtar och extraherar text ur PDF-bilaga (nödvändigt för HD och MÖD som saknar HTML-fulltext); extraherad text cachas lokalt
+- **hamta_pdf** — hämtar och extraherar text ur PDF-bilaga (nödvändigt för HD och MÖD som saknar HTML-fulltext); extraherad text cachas lokalt. Tar `max_tecken` och `fran_tecken` för långa domar — ett kapat svar avslutas med en rad som anger hur mycket som visas och hur resten hämtas
 - **sok_rattpraxis_for_lagrum** — söker praxis kopplad till en specifik paragraf i en lag, t.ex. alla HD-domar om 36 § avtalslagen
 - **hamta_avgorande_pa_beteckning** — söker på NJA-nummer (NJA 2025:67), HFD-referat (HFD 2026 ref. 1), HD:s kortnamn eller målnummer
 - **sok_i_domtext** — söker fulltext inuti cachade domtexter; PostgreSQL ger avancerad FTS med relevansrankning och kontextutdrag, SQLite ger enklare LIKE-sökning

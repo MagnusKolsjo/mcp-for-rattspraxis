@@ -61,6 +61,11 @@ log = logging.getLogger(__name__)
 
 _API_BAS = "https://rattspraxis.etjanst.domstol.se/api/v1"
 
+# Standardtak för domtext i hamta_pdf. Utan ett tak som gäller by default kan ett
+# långt avgörande överskrida MCP-protokollets storleksgräns och misslyckas helt.
+# Anroparen kan alltid höja taket, eller sätta 0 för hela texten.
+RP_MAX_TECKEN = int(os.getenv("RP_MAX_TECKEN", "60000"))
+
 # Maximalt antal träffar per API-sida — API:et tillåter upp till 50.
 # Värdet är ett designval: 50 balanserar svarstid mot täckning vid paginering.
 _MAX_PER_SIDA = 50
@@ -104,6 +109,56 @@ def _expandera_domstolkoder(koder: list[str] | None) -> list[str] | None:
             if utokad not in expanderade:
                 expanderade.append(utokad)
     return expanderade
+
+
+# ---------------------------------------------------------------------------
+# Textutdrag och trunkering
+# ---------------------------------------------------------------------------
+
+def _tal(n: int) -> str:
+    """Heltal med svensk tusentalsavgränsare (hårt blanksteg, U+00A0)."""
+    return f"{n:,}".replace(",", " ")
+
+
+def _skar_ut_text(
+    text: str,
+    max_tecken: int,
+    fran_tecken: int = 0,
+    anvisning: str = "",
+) -> str:
+    """
+    Skär ut ett textutdrag och markera alltid när något kapats.
+
+    Trunkering utan markör är ett tyst datafel — svaret ser ut att vara hela
+    innehållet, och ett domskäl som klipps mitt i går inte att skilja från ett
+    som slutar där. Ett kapat utdrag avslutas därför med en rad som anger hur
+    mycket som visas av hur mycket, och hur resten hämtas.
+
+    max_tecken <= 0 betyder ingen trunkering. Klipper på ord- eller radgräns.
+    """
+    text   = text or ""
+    totalt = len(text)
+    start  = max(0, min(fran_tecken, totalt))
+    rest   = text[start:]
+
+    kapad = bool(max_tecken and max_tecken > 0 and len(rest) > max_tecken)
+    if kapad:
+        utdrag    = rest[:max_tecken]
+        brytpunkt = max(utdrag.rfind(" "), utdrag.rfind("\n"))
+        if brytpunkt > max_tecken * 0.6:
+            utdrag = utdrag[:brytpunkt]
+        utdrag = utdrag.rstrip()
+    else:
+        utdrag = rest
+
+    if not kapad and start == 0:
+        return utdrag
+
+    slut  = start + len(utdrag)
+    noter = [f"Visar tecken {_tal(start + 1)}–{_tal(slut)} av {_tal(totalt)}"]
+    if anvisning:
+        noter.append(anvisning)
+    return utdrag + "\n\n[" + ". ".join(noter) + "]"
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +420,24 @@ async def lista_verktyg() -> list[types.Tool]:
                         "type": "string",
                         "description": "Filnamn på PDF:en, t.ex. 'B 712-25.pdf' (valfritt, för cachelogg)",
                     },
+                    "max_tecken": {
+                        "type": "integer",
+                        "description": (
+                            "Teckentak för den returnerade domtexten (standard 60 000, 0 = hela texten). "
+                            "Sätt ett tak för långa domar så att svaret inte överskrider "
+                            "storleksgränsen. Ett kapat svar avslutas med en rad som anger "
+                            "hur mycket som visas och hur resten hämtas."
+                        ),
+                        "default": 60000,
+                    },
+                    "fran_tecken": {
+                        "type": "integer",
+                        "description": (
+                            "Börja texten vid denna teckenposition — för att läsa vidare "
+                            "där ett kapat svar slutade. Citera aldrig ur ett kapat utdrag."
+                        ),
+                        "default": 0,
+                    },
                 },
                 "required": ["fillagring_id"],
             },
@@ -595,7 +668,14 @@ def _sakerstall_avgorande_cache(avgorande_id: str):
         log.warning("Kunde inte cacha metadata för avgörande %s: %s", avgorande_id, e)
 
 
-async def _hamta_pdf(fillagring_id, avgorande_id=None, filnamn=None):
+async def _hamta_pdf(fillagring_id, avgorande_id=None, filnamn=None,
+                     max_tecken=RP_MAX_TECKEN, fran_tecken=0):
+    def _anvisning(fran_ny):
+        return (
+            f'Läs vidare: hamta_pdf(fillagring_id="{fillagring_id}", '
+            f"fran_tecken={fran_ny})"
+        )
+
     # Försök cache först
     cachad_text = _las_pdf_cache(fillagring_id)
     if cachad_text:
@@ -603,7 +683,11 @@ async def _hamta_pdf(fillagring_id, avgorande_id=None, filnamn=None):
         # Retroaktiv metadata-fyllning: säkerställ att avgorande_cache är
         # populerad även för PDF:er som cachades innan denna fix.
         _sakerstall_avgorande_cache(avgorande_id)
-        return [types.TextContent(type="text", text=cachad_text)]
+        return [types.TextContent(
+            type="text",
+            text=_skar_ut_text(cachad_text, max_tecken, fran_tecken,
+                               _anvisning(fran_tecken + max_tecken)),
+        )]
 
     # Importera pymupdf4llm (lazy — krävs bara när PDF-hämtning sker)
     try:
@@ -656,7 +740,12 @@ async def _hamta_pdf(fillagring_id, avgorande_id=None, filnamn=None):
     # kan returnera domstolkod, avgorandedatum och benamning.
     _sakerstall_avgorande_cache(avgorande_id)
 
-    return [types.TextContent(type="text", text=markdown_text)]
+    # Cachen har alltid hela texten — trunkeringen gäller bara svaret.
+    return [types.TextContent(
+        type="text",
+        text=_skar_ut_text(markdown_text, max_tecken, fran_tecken,
+                           _anvisning(fran_tecken + max_tecken)),
+    )]
 
 
 async def _sok_rattpraxis_for_lagrum(
