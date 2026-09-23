@@ -278,7 +278,7 @@ def _formatera_avgorande(a: dict, inkludera_innehall: bool = False) -> dict:
         "domstolkod": (a.get("domstol") or {}).get("domstolKod"),
         "avgorandedatum": a.get("avgorandedatum"),
         "publiceringstid": a.get("publiceringstid"),
-        "ar_vagledande": a.get("arVagledande"),
+        "ar_vagledande": db.ar_vagledande(a),
         "benamning": a.get("benamning"),
         "sammanfattning": a.get("sammanfattning"),
         "malnummer": a.get("malNummerLista", []),
@@ -616,7 +616,10 @@ async def _sok_rattpraxis(
     if domstolkoder:
         f["domstolKodLista"] = _expandera_domstolkoder(domstolkoder)
     if ar_vagledande is not None:
-        f["arVagledande"] = ar_vagledande
+        # API:et saknar filter på "vägledande"; det uttrycks som avgörandetyper.
+        f["avgorandeTypLista"] = (
+            db.VAGLEDANDE_TYPER if ar_vagledande else db.EJ_VAGLEDANDE_TYPER
+        )
     if rattsomrade:
         f["rattsomradeLista"] = [rattsomrade]
     if sfs_nummer:
@@ -784,7 +787,10 @@ async def _sok_rattpraxis_for_lagrum(
 
     f = body["filter"]
     if ar_vagledande is not None:
-        f["arVagledande"] = ar_vagledande
+        # API:et saknar filter på "vägledande"; det uttrycks som avgörandetyper.
+        f["avgorandeTypLista"] = (
+            db.VAGLEDANDE_TYPER if ar_vagledande else db.EJ_VAGLEDANDE_TYPER
+        )
     _satt_datumintervall(f, datum_fran, datum_till)
 
     # Notera: sok_rattpraxis_for_lagrum filtrerar inte på domstol via API —

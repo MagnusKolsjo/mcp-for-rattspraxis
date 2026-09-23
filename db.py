@@ -31,6 +31,28 @@ METADATA_CACHE_TTL_DAGAR = int(os.getenv("METADATA_CACHE_TTL_DAGAR", "30"))
 
 
 # ---------------------------------------------------------------------------
+# Avgörandetyp
+# ---------------------------------------------------------------------------
+#
+# API:et har inget eget fält för om ett avgörande är vägledande. Det framgår
+# av avgörandetypen (typ): prejudikat och vägledande avgöranden mot avgöranden
+# som uttryckligen inte är vägledande och beslut om prövningstillstånd.
+
+VAGLEDANDE_TYPER = ["PREJUDIKAT", "VAGLEDANDE_MEN_EJ_PREJUDICERANDE"]
+EJ_VAGLEDANDE_TYPER = ["EJ_VAGLEDANDE", "PROVNINGSTILLSTAND"]
+
+
+def ar_vagledande(a: dict) -> bool | None:
+    """True/False utifrån avgörandetypen, None om typen saknas eller är okänd."""
+    typ = a.get("typ")
+    if typ in VAGLEDANDE_TYPER:
+        return True
+    if typ in EJ_VAGLEDANDE_TYPER:
+        return False
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Backend-hjälpfunktioner
 # ---------------------------------------------------------------------------
 
@@ -227,7 +249,7 @@ def _skriv_avgorande_cache(a: dict):
         avgorande_id = a.get("id", "")
         domstolkod = (a.get("domstol") or {}).get("domstolKod")
         avgorandedatum = a.get("avgorandedatum")
-        ar_vagledande = a.get("arVagledande")
+        vagledande = ar_vagledande(a)
         benamning = a.get("benamning")
         nu = _nu_utc().isoformat()
 
@@ -240,7 +262,7 @@ def _skriv_avgorande_cache(a: dict):
                     data = EXCLUDED.data,
                     hamtat = EXCLUDED.hamtat,
                     ttl_expires = EXCLUDED.ttl_expires
-            """, (avgorande_id, domstolkod, avgorandedatum, ar_vagledande, benamning,
+            """, (avgorande_id, domstolkod, avgorandedatum, vagledande, benamning,
                   json.dumps(a, ensure_ascii=False), nu, ttl.isoformat()))
         else:
             cur.execute("""
@@ -248,7 +270,7 @@ def _skriv_avgorande_cache(a: dict):
                     (id, domstolkod, avgorandedatum, ar_vagledande, benamning, data, hamtat, ttl_expires)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (avgorande_id, domstolkod, avgorandedatum,
-                  1 if ar_vagledande else 0, benamning,
+                  None if vagledande is None else int(vagledande), benamning,
                   json.dumps(a, ensure_ascii=False), nu, ttl.isoformat()))
 
         conn.commit()
