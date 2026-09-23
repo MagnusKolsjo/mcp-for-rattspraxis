@@ -8,7 +8,7 @@ Exponerar sex verktyg:
   hamta_pdf                      — hämta + extrahera PDF-bilaga (cachas lokalt)
   sok_rattpraxis_for_lagrum      — sök på specifik paragraf i en lag
   hamta_avgorande_pa_beteckning  — sök på NJA-nummer, HFD-referat, kortnamn, målnummer
-  sok_i_domtext                  — fulltext-sökning inuti cachade domar (FTS)
+  sok_i_domtext                  — fulltext-sökning i lokalt lagrade domtexter (FTS)
 
 Konfiguration via .env-fil — se config.example.env.
 """
@@ -366,21 +366,31 @@ class Lagrumsresultat(TypedDict):
 
 
 class Domtexttraff(TypedDict):
+    kalla: str
     fillagring_id: str | None
     avgorande_id: str | None
-    domstolkod: NotRequired[str | None]
-    avgorandedatum: NotRequired[str | None]
-    benamning: NotRequired[str | None]
-    sammanfattning: NotRequired[str | None]
+    domstolkod: str | None
+    avgorandedatum: str | None
+    benamning: str | None
+    sammanfattning: str | None
     filnamn: NotRequired[str | None]
     relevans: NotRequired[float]
     utdrag: str | None
+
+
+class Tackning(TypedDict):
+    avgoranden_lokalt: int
+    pdf_texter_lokalt: int
+    heltackande: bool
+    senaste_synk: str | None
+    fullsynk_klar: str | None
 
 
 class Domtextresultat(TypedDict):
     sokterm: str
     antal_treffar: int
     info: NotRequired[str]
+    tackning: NotRequired[Tackning]
     treffar: list[Domtexttraff]
 
 
@@ -498,7 +508,9 @@ mcp = MCPServer(
         "hamta_pdf och fillagring_id ur bilagor[]. En kapad domtext avslutas med "
         "en rad som anger hur resten hämtas — citera aldrig ur ett kapat utdrag.\n\n"
         "SÖKNING I DOMTEXTEN: sok_i_domtext söker i den lokala databasen, inte "
-        "hos källan. Den täcker de avgöranden som finns lokalt."
+        "hos källan. Efter en fullsynk täcker den hela korpusen; fältet "
+        "tackning i svaret visar hur mycket som finns lokalt. En bred sökning "
+        "hos källan snävas in med sok_rattpraxis(forfiningar=true)."
     ),
     version="1.2.0",
     cache_hints=CACHE_HINTAR,
@@ -943,7 +955,125 @@ def hamta_avgorande_pa_beteckning(
     return result
 
 
-@mcp.tool(title="Sök i cachade domtexter", annotations=LASNING_DB)
+def _tackning() -> dict | None:
+    """Hur mycket av korpusen som finns lokalt. None om det inte går att läsa."""
+    try:
+        antal = db.rakna_lokalt()
+        lage = db.las_synk_status("publiceringar") or {}
+    except Exception as e:
+        log.warning("Täckningen kunde inte läsas: %s", e)
+        return None
+    return {
+        "avgoranden_lokalt": antal["avgoranden"],
+        "pdf_texter_lokalt": antal["pdf_texter"],
+        "heltackande": bool(lage.get("fullsynk_klar")),
+        "senaste_synk": lage.get("avslutad") if lage.get("status") == "klar" else None,
+        "fullsynk_klar": lage.get("fullsynk_klar"),
+    }
+
+
+def _sok_domtext_postgres(cur, sokterm: str, domstolkoder: list[str] | None,
+                          antal: int) -> list[dict]:
+    """Fulltextsökning med relevansrankning och utdrag i båda textkällorna."""
+    domstol_filter = ""
+    domstol_params: list = []
+    if domstolkoder:
+        domstol_filter = f"AND ac.domstolkod IN ({', '.join(['%s'] * len(domstolkoder))})"
+        domstol_params = list(domstolkoder)
+
+    # ts_headline är dyr på långa domar, så utdragen tas bara fram för de
+    # högst rankade träffarna i den yttre frågan.
+    fraga = f"""
+        WITH q AS (SELECT plainto_tsquery('swedish', %s) AS q),
+        traffar AS (
+            SELECT 'pdf' AS kalla, pc.fillagring_id, pc.avgorande_id,
+                   ac.domstolkod, ac.avgorandedatum, ac.benamning,
+                   ac.data->>'sammanfattning' AS sammanfattning, pc.filnamn,
+                   ts_rank(pc.text_tsv, q.q) AS rank, pc.text_md AS text
+            FROM rattspraxis.pdf_cache pc
+            CROSS JOIN q
+            LEFT JOIN rattspraxis.avgorande_cache ac ON ac.id = pc.avgorande_id
+            WHERE pc.text_tsv @@ q.q {domstol_filter}
+            UNION ALL
+            SELECT 'avgorande', NULL, ac.id,
+                   ac.domstolkod, ac.avgorandedatum, ac.benamning,
+                   ac.data->>'sammanfattning', NULL,
+                   ts_rank(ac.sokbar_tsv, q.q), ac.sokbar_text
+            FROM rattspraxis.avgorande_cache ac
+            CROSS JOIN q
+            WHERE ac.sokbar_tsv @@ q.q {domstol_filter}
+            ORDER BY rank DESC
+            LIMIT %s
+        )
+        SELECT t.kalla, t.fillagring_id, t.avgorande_id, t.domstolkod,
+               t.avgorandedatum, t.benamning, t.sammanfattning, t.filnamn, t.rank,
+               ts_headline('swedish', t.text, q.q,
+                   'MaxFragments=3, MaxWords=40, MinWords=15,
+                    StartSel=>>>, StopSel=<<<')
+        FROM traffar t CROSS JOIN q
+        ORDER BY t.rank DESC
+    """
+    cur.execute(fraga, [sokterm, *domstol_params, *domstol_params, antal])
+    return [
+        {
+            "kalla": rad[0],
+            "fillagring_id": rad[1],
+            "avgorande_id": rad[2],
+            "domstolkod": rad[3],
+            "avgorandedatum": str(rad[4]) if rad[4] else None,
+            "benamning": rad[5],
+            "sammanfattning": rad[6],
+            "filnamn": rad[7],
+            "relevans": float(rad[8]) if rad[8] else 0.0,
+            "utdrag": rad[9],
+        }
+        for rad in cur.fetchall()
+    ]
+
+
+def _sok_domtext_sqlite(cur, sokterm: str, domstolkoder: list[str] | None,
+                        antal: int) -> list[dict]:
+    """Enkel delsträngssökning (LIKE) i båda textkällorna, utan rankning."""
+    domstol_filter = ""
+    domstol_params: list = []
+    if domstolkoder:
+        domstol_filter = f"AND ac.domstolkod IN ({', '.join(['?'] * len(domstolkoder))})"
+        domstol_params = list(domstolkoder)
+    monster = f"%{sokterm}%"
+    cur.execute(f"""
+        SELECT 'pdf', pc.fillagring_id, pc.avgorande_id, ac.domstolkod,
+               ac.avgorandedatum, ac.benamning,
+               json_extract(ac.data, '$.sammanfattning'), pc.filnamn,
+               substr(pc.text_md, max(instr(lower(pc.text_md), lower(?)) - 100, 1), 300)
+        FROM pdf_cache pc
+        LEFT JOIN avgorande_cache ac ON ac.id = pc.avgorande_id
+        WHERE lower(pc.text_md) LIKE lower(?) {domstol_filter}
+        UNION ALL
+        SELECT 'avgorande', NULL, ac.id, ac.domstolkod,
+               ac.avgorandedatum, ac.benamning,
+               json_extract(ac.data, '$.sammanfattning'), NULL,
+               substr(ac.sokbar_text, max(instr(lower(ac.sokbar_text), lower(?)) - 100, 1), 300)
+        FROM avgorande_cache ac
+        WHERE lower(ac.sokbar_text) LIKE lower(?) {domstol_filter}
+        LIMIT ?
+    """, [sokterm, monster, *domstol_params, sokterm, monster, *domstol_params, antal])
+    return [
+        {
+            "kalla": rad[0],
+            "fillagring_id": rad[1],
+            "avgorande_id": rad[2],
+            "domstolkod": rad[3],
+            "avgorandedatum": rad[4],
+            "benamning": rad[5],
+            "sammanfattning": rad[6],
+            "filnamn": rad[7],
+            "utdrag": rad[8],
+        }
+        for rad in cur.fetchall()
+    ]
+
+
+@mcp.tool(title="Sök i lokalt lagrade domtexter", annotations=LASNING_DB)
 def sok_i_domtext(
     sokterm: Annotated[str, Field(
         description="Sökterm eller fras att leta efter i domtexterna",
@@ -956,16 +1086,21 @@ def sok_i_domtext(
     )] = 10,
 ) -> Domtextresultat:
     """
-    Söker fulltext inuti cachade domstolsavgöranden. Kräver att domar
-    dessförinnan hämtats med hamta_pdf (texten cachas lokalt). Använd för att
-    hitta specifika resonemang, lagcitat eller rättsliga principer i
-    domtexterna — kompletterar metadata-sökning med sökning i domskälen.
-    PostgreSQL: avancerad FTS med träffrelevans och utdrag. SQLite: enklare
-    textsökning.
+    Söker fulltext inuti domstolsavgöranden i den lokala databasen: HTML-
+    fulltexten, sammanfattningen och benämningen för varje lokalt lagrat
+    avgörande, samt PDF-texter som hämtats med hamta_pdf. När servern synkas
+    dagligen omfattar databasen hela Domstolsverkets korpus; annars bara de
+    avgöranden som hämtats tidigare. Fältet tackning visar vilket. Domar och
+    beslut från HD och MÖD som bara finns som PDF är sökbara på
+    sammanfattningen tills PDF:en hämtats. Använd för att hitta specifika
+    resonemang, lagcitat eller rättsliga principer i domtexterna — kompletterar
+    metadata-sökning med sökning i domskälen. Varje träff anger kalla
+    ('avgorande' eller 'pdf'). PostgreSQL: avancerad FTS med träffrelevans och
+    utdrag. SQLite: enklare textsökning.
     """
     max_antal = max(1, min(int(max_antal or 10), 50))
     # Expandera domstolkod till historiska alias (HFD↔REGR, MMOD↔MOD)
-    domstolkoder_expanded = _expandera_domstolkoder([domstolkod]) if domstolkod else None
+    domstolkoder = _expandera_domstolkoder([domstolkod]) if domstolkod else None
 
     if not _DATABASE_URL:
         raise ToolError(
@@ -982,111 +1117,47 @@ def sok_i_domtext(
             "databasservern är igång och försök igen."
         ) from e
 
+    # Samma avgörande kan träffa både i sin HTML-text och i sin PDF. Det
+    # hämtas därför fler rader än som visas, och varje avgörande redovisas
+    # en gång, med sin bäst rankade träff.
     try:
         cur = conn.cursor()
-
         if _ar_postgres():
-            # PostgreSQL FTS med ts_headline för kontextutdrag
-            # Joinar mot avgorande_cache för metadata och domstolsfiltrering
-            domstol_filter = ""
-            params: list = [sokterm, sokterm, sokterm]
-
-            if domstolkoder_expanded:
-                placeholders = ", ".join(["%s"] * len(domstolkoder_expanded))
-                domstol_filter = f"AND ac.domstolkod IN ({placeholders})"
-                params.extend(domstolkoder_expanded)
-
-            params.append(max_antal)
-
-            fraga = f"""
-                SELECT
-                    pc.fillagring_id,
-                    pc.avgorande_id,
-                    ac.domstolkod,
-                    ac.avgorandedatum,
-                    ac.benamning,
-                    ac.data->>'sammanfattning'        AS sammanfattning,
-                    ts_rank(pc.text_tsv,
-                        plainto_tsquery('swedish', %s)) AS rank,
-                    ts_headline(
-                        'swedish', pc.text_md,
-                        plainto_tsquery('swedish', %s),
-                        'MaxFragments=3, MaxWords=40, MinWords=15,
-                         StartSel=>>>, StopSel=<<<'
-                    )                                 AS utdrag
-                FROM rattspraxis.pdf_cache pc
-                LEFT JOIN rattspraxis.avgorande_cache ac
-                    ON ac.id = pc.avgorande_id
-                WHERE pc.text_tsv @@ plainto_tsquery('swedish', %s)
-                {domstol_filter}
-                ORDER BY rank DESC
-                LIMIT %s
-            """
-            cur.execute(fraga, params)
-            rader = cur.fetchall()
-
-            treffar = [
-                {
-                    "fillagring_id": rad[0],
-                    "avgorande_id": rad[1],
-                    "domstolkod": rad[2],
-                    "avgorandedatum": str(rad[3]) if rad[3] else None,
-                    "benamning": rad[4],
-                    "sammanfattning": rad[5],
-                    "relevans": float(rad[6]) if rad[6] else 0.0,
-                    "utdrag": rad[7],
-                }
-                for rad in rader
-            ]
-
+            rader = _sok_domtext_postgres(cur, sokterm, domstolkoder, max_antal * 2)
         else:
-            # SQLite — enkel LIKE-sökning
-            if domstolkoder_expanded:
-                placeholders = ", ".join(["?"] * len(domstolkoder_expanded))
-                domstol_filter = f"AND domstolkod IN ({placeholders})"
-            else:
-                domstol_filter = ""
-            params_sqlite: list = [f"%{sokterm}%"]
-            if domstolkoder_expanded:
-                params_sqlite.extend(domstolkoder_expanded)
-            params_sqlite.append(max_antal)
-
-            cur.execute(f"""
-                SELECT
-                    pc.fillagring_id,
-                    pc.avgorande_id,
-                    pc.filnamn,
-                    substr(pc.text_md, instr(lower(pc.text_md), lower(?)) - 100, 300) AS utdrag
-                FROM pdf_cache pc
-                LEFT JOIN avgorande_cache ac ON ac.id = pc.avgorande_id
-                WHERE lower(pc.text_md) LIKE lower(?)
-                {domstol_filter}
-                LIMIT ?
-            """, [sokterm] + params_sqlite)
-            rader = cur.fetchall()
-
-            treffar = [
-                {
-                    "fillagring_id": rad[0],
-                    "avgorande_id": rad[1],
-                    "filnamn": rad[2],
-                    "utdrag": rad[3],
-                }
-                for rad in rader
-            ]
+            rader = _sok_domtext_sqlite(cur, sokterm, domstolkoder, max_antal * 2)
     except Exception as e:
         log.error("Fel i sok_i_domtext: %s", e, exc_info=True)
         raise ToolError(f"Sökningen i den lokala databasen misslyckades: {e}") from e
     finally:
         conn.close()
 
+    treffar: list[dict] = []
+    sedda: set[str] = set()
+    for rad in rader:
+        nyckel = rad["avgorande_id"] or rad["fillagring_id"] or ""
+        if nyckel in sedda:
+            continue
+        sedda.add(nyckel)
+        treffar.append(rad)
+        if len(treffar) >= max_antal:
+            break
+
     resultat: Domtextresultat = {
         "sokterm": sokterm,
         "antal_treffar": len(treffar),
         "treffar": treffar,
     }
-    if not treffar:
-        resultat["info"] = "Söker bara i domar som tidigare hämtats med hamta_pdf."
+    tackning = _tackning()
+    if tackning is not None:
+        resultat["tackning"] = tackning
+        if not tackning["heltackande"]:
+            resultat["info"] = (
+                f"Sökningen omfattar bara de {tackning['avgoranden_lokalt']} avgöranden "
+                "och de PDF-texter som finns lokalt, inte hela Domstolsverkets "
+                "korpus. Kör 01_synka_publiceringar.py för att lagra alla "
+                "publiceringar lokalt."
+            )
     return resultat
 
 

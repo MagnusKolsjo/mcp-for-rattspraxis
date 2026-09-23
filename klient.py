@@ -25,6 +25,10 @@ HEADERS = {
     "User-Agent": "mcp-for-rattspraxis/1.0 (+https://github.com/MagnusKolsjo/mcp-for-rattspraxis)",
 }
 
+# GET /publiceringar returnerar högst 100 publiceringar per sida, även om
+# en större sidstorlek begärs.
+MAX_SIDSTORLEK_PUBLICERINGAR = 100
+
 
 class KallaFel(RuntimeError):
     """Domstolsverkets API svarade inte, eller inte med det som väntades."""
@@ -127,6 +131,32 @@ def hamta_grupp(grupp_id: str) -> list[dict]:
     """
     kodat = urllib.parse.quote(grupp_id, safe="")
     data = _json(_anropa("GET", f"/publiceringar/grupp/{kodat}"))
+    return data if isinstance(data, list) else []
+
+
+def lista_publiceringar(
+    publicerad_fran_och_med: str | None,
+    sida: int,
+    sidstorlek: int = MAX_SIDSTORLEK_PUBLICERINGAR,
+    timeout: float = 60,
+) -> list[dict]:
+    """
+    GET /publiceringar sorterat på publiceringstid, äldst först.
+
+    Den stigande ordningen gör att publiceringar som tillkommer under en
+    pågående sidindelning hamnar efter de sidor som redan hämtats, i stället
+    för att förskjuta dem. `sida` är 0-baserad. Svaren innehåller hela
+    publiceringen, med HTML-fulltext där sådan finns.
+    """
+    params = {
+        "sortorder": "publiceringstid",
+        "asc": "true",
+        "page": sida,
+        "pagesize": min(sidstorlek, MAX_SIDSTORLEK_PUBLICERINGAR),
+    }
+    if publicerad_fran_och_med:
+        params["publicerad_fran_och_med"] = publicerad_fran_och_med
+    data = _json(_anropa("GET", "/publiceringar", timeout=timeout, params=params))
     return data if isinstance(data, list) else []
 
 
