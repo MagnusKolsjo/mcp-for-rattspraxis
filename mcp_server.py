@@ -328,12 +328,34 @@ class AvgorandeMedKompanjon(Avgorande):
     sokresultat_antal: NotRequired[int]
 
 
+class Forfiningsvarde(TypedDict):
+    varde: str
+    antal: int
+
+
+class Forfining(TypedDict):
+    antal_varden: int
+    varden: list[Forfiningsvarde]
+
+
+class Forfiningar(TypedDict):
+    domstolar: Forfining
+    sfs_nummer: Forfining
+    rattsomraden: Forfining
+    nyckelord: Forfining
+    avgorandetyper: Forfining
+    publiceringsformer: Forfining
+    info: str
+
+
 class Sokresultat(TypedDict):
     total: int
     sida: int
     antal_per_sida: int
     antal_sidor: int
     avgoranden: list[Avgorande]
+    forfiningar: NotRequired[Forfiningar]
+    info: NotRequired[str]
 
 
 class Lagrumsresultat(TypedDict):
@@ -412,6 +434,50 @@ def _formatera_avgorande(a: dict, inkludera_innehall: bool = False) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Sökförfiningar
+# ---------------------------------------------------------------------------
+#
+# /sokforfiningar räknar träffarna per värde för sex dimensioner. Nyckelord
+# och lagrum kan ha tusentals olika värden för en bred sökning, så bara de
+# vanligaste redovisas; antal_varden visar hur många som finns totalt.
+
+_MAX_FORFININGSVARDEN = 20
+
+# Svarets nycklar hos API:et → namn i verktygets svar
+_FORFININGAR = {
+    "domstolsidMap": "domstolar",
+    "sfsnummerMap": "sfs_nummer",
+    "rattsomradeMap": "rattsomraden",
+    "sokordMap": "nyckelord",
+    "avgorandetypMap": "avgorandetyper",
+    "publiceringsformMap": "publiceringsformer",
+}
+
+
+def _formatera_forfiningar(data: dict) -> dict:
+    """Sorterar varje dimension efter antal och behåller de vanligaste värdena."""
+    resultat: dict = {}
+    for api_nyckel, namn in _FORFININGAR.items():
+        karta = data.get(api_nyckel) or {}
+        sorterade = sorted(karta.items(), key=lambda kv: (-(kv[1] or 0), kv[0]))
+        resultat[namn] = {
+            "antal_varden": len(karta),
+            "varden": [
+                {"varde": varde, "antal": int(antal or 0)}
+                for varde, antal in sorterade[:_MAX_FORFININGSVARDEN]
+            ],
+        }
+    resultat["info"] = (
+        f"Högst {_MAX_FORFININGSVARDEN} värden per dimension, vanligast först. "
+        "Snäva in med domstolkoder, sfs_nummer, rattsomrade eller nyckelord. "
+        "Domstolarna räknas som om domstolsfiltret inte vore satt, så att "
+        "alternativen syns även efter en avgränsning. Källan redovisar inte "
+        "fördelningen per år; avgränsa i tid med datum_fran och datum_till."
+    )
+    return resultat
+
+
+# ---------------------------------------------------------------------------
 # MCP-server
 # ---------------------------------------------------------------------------
 
@@ -482,6 +548,14 @@ def sok_rattpraxis(
     antal_per_sida: Annotated[int, Field(
         description="Träffar per sida, 1–50 (standard: 10)",
     )] = 10,
+    forfiningar: Annotated[bool, Field(
+        description=(
+            "true = redovisa även hur träffarna fördelar sig på domstolar, lagar "
+            "(SFS-nummer), rättsområden, nyckelord, avgörandetyper och "
+            "publiceringsformer, med antal per värde. Använd vid breda sökningar "
+            "för att se hur de kan snävas in (standard: false)"
+        ),
+    )] = False,
 ) -> Sokresultat:
     """
     Söker i Domstolsverkets rättspraxis-databas (~17 500 avgöranden från svenska
@@ -489,7 +563,8 @@ def sok_rattpraxis(
     finns från mars 2025. Returnerar sammanfattningar, lagrumshänvisningar och
     korsreferenser till förarbeten och EU-domstolsbeslut. Använd sfs_nummer för
     praxis kopplad till en specifik lag, domstolkoder=['HDO'] för enbart Högsta
-    domstolens prejudikat.
+    domstolens prejudikat. Ger sökningen många träffar: sätt forfiningar=true
+    för att se hur de fördelar sig på domstolar, lagar och nyckelord.
     """
     antal_per_sida = max(1, min(int(antal_per_sida or 10), _MAX_PER_SIDA))
     sid_index = max(0, int(sid_index or 0))
@@ -522,13 +597,23 @@ def sok_rattpraxis(
     treffar = data.get("publiceringLista") or []
 
     antal_sidor = (total + antal_per_sida - 1) // antal_per_sida if total > 0 else 0
-    return {
+    resultat: Sokresultat = {
         "total": total,
         "sida": sid_index + 1,
         "antal_per_sida": antal_per_sida,
         "antal_sidor": antal_sidor,
         "avgoranden": [_formatera_avgorande(a) for a in treffar],
     }
+
+    if forfiningar:
+        # Förfiningarna är ett tillägg till träffarna. Svarar källan inte på
+        # dem redovisas träffarna ändå, med en notering om vad som saknas.
+        try:
+            resultat["forfiningar"] = _formatera_forfiningar(klient.sokforfiningar(body))
+        except klient.KallaFel as e:
+            log.warning("sokforfiningar misslyckades: %s", e)
+            resultat["info"] = f"Förfiningarna kunde inte hämtas: {e}"
+    return resultat
 
 
 @mcp.tool(title="Hämta avgörande", annotations=LASNING_EXTERN)

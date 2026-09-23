@@ -93,6 +93,15 @@ def sok(body: dict) -> dict:
     return _json(_anropa("POST", "/sok", json=body)) or {}
 
 
+def sokforfiningar(body: dict) -> dict:
+    """
+    POST /sokforfiningar. Tar samma sökbegäran som /sok och returnerar
+    antal träffar per värde, grupperat: sokordMap, rattsomradeMap,
+    sfsnummerMap, avgorandetypMap, publiceringsformMap och domstolsidMap.
+    """
+    return _json(_anropa("POST", "/sokforfiningar", json=body)) or {}
+
+
 def hamta_publicering(avgorande_id: str) -> dict:
     """
     GET /publiceringar/{id}. Returnerar hela publiceringen.
