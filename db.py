@@ -12,7 +12,6 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -67,8 +66,12 @@ def _hamta_db():
         import psycopg2
         return psycopg2.connect(DATABASE_URL)
     import sqlite3
-    parsed = urlparse(DATABASE_URL)
-    db_fil = parsed.path.lstrip("/") if DATABASE_URL.startswith("sqlite:///") else DATABASE_URL
+    # sqlite:///relativ.db och sqlite:////absolut/sokvag.db. Det som följer
+    # efter de tre snedstrecken är sökvägen; ett fjärde gör den absolut.
+    if DATABASE_URL.startswith("sqlite:///"):
+        db_fil = DATABASE_URL[len("sqlite:///"):]
+    else:
+        db_fil = DATABASE_URL
     db_fil = db_fil or "rattspraxis_cache.db"
     if not os.path.isabs(db_fil):
         db_fil = str(_SCRIPT_DIR / db_fil)
