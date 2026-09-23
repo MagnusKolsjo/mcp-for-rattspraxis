@@ -250,36 +250,37 @@ def _satt_vagledande(filter_: dict, ar_vagledande: bool | None) -> None:
 
 def _hamta_grupp_kompanjon(avgorande: dict) -> dict | None:
     """
-    Slår upp syskonpublication via benamning-exaktsökning.
+    Hämtar syskonpubliceringen i samma grupp via GET /publiceringar/grupp/{id}.
 
-    gruppKorrelationsnummer grupperar två varianter av samma avgörande:
+    gruppKorrelationsnummer grupperar varianterna av samma avgörande:
       DOM_ELLER_BESLUT — publiceras direkt, saknar NJA-nummer
       REFERAT          — publiceras 6–12 mån senare, bär NJA-nummer och rubrik
+    En grupp kan också innehålla en notis eller ett beslut om
+    prövningstillstånd. Kompanjonen är i första hand motsvarigheten i paret
+    dom–referat, annars den första andra publiceringen i gruppen.
 
-    Returnerar kompanjonen eller None om ingen hittas.
+    Returnerar kompanjonen eller None om gruppen saknar andra publiceringar.
+    Ett fel hos källan loggas och ger None: kompanjonen är ett tillägg till
+    ett avgörande som redan hämtats, och ska inte fälla hela svaret.
     """
-    benamning = (avgorande.get("benamning") or "").strip()
-    if not benamning:
+    grupp_id = avgorande.get("gruppKorrelationsnummer")
+    if not grupp_id:
+        return None
+    try:
+        gruppen = klient.hamta_grupp(grupp_id)
+    except klient.KallaFel as e:
+        log.warning("Kunde inte hämta gruppen %s: %s", grupp_id, e)
         return None
 
-    body = {
-        "sokfras": {"andLista": [], "exaktFras": benamning},
-        "filter": {},
-        "sortorder": "desc",
-        "sidIndex": 0,
-        "antalPerSida": 5,
-    }
-    try:
-        data = klient.sok(body)
-        for hit in data.get("publiceringLista", []):
-            if (
-                hit.get("id") != avgorande.get("id")
-                and (hit.get("benamning") or "").strip() == benamning
-            ):
-                return hit
-    except Exception as e:
-        log.warning("Kunde inte hämta grupp-kompanjon för '%s': %s", benamning, e)
-    return None
+    andra = [p for p in gruppen if p.get("id") != avgorande.get("id")]
+    if not andra:
+        return None
+    motsvarighet = {"DOM_ELLER_BESLUT": "REFERAT", "REFERAT": "DOM_ELLER_BESLUT"}
+    onskad = motsvarighet.get(avgorande.get("publiceringsform") or "")
+    for p in andra:
+        if onskad and p.get("publiceringsform") == onskad:
+            return p
+    return andra[0]
 
 
 # ---------------------------------------------------------------------------
@@ -848,7 +849,7 @@ def hamta_avgorande_pa_beteckning(
                     kompanjon = t
                     break
 
-        # Annars sök via benamning
+        # Annars hämta gruppen
         if kompanjon is None:
             kompanjon = _hamta_grupp_kompanjon(a)
 

@@ -110,6 +110,17 @@ def hamta_publicering(avgorande_id: str) -> dict:
     return data
 
 
+def hamta_grupp(grupp_id: str) -> list[dict]:
+    """
+    GET /publiceringar/grupp/{id}. Returnerar alla publiceringar med samma
+    gruppKorrelationsnummer — typiskt domen eller beslutet och det senare
+    referatet av samma avgörande. Ett okänt grupp-id ger en tom lista.
+    """
+    kodat = urllib.parse.quote(grupp_id, safe="")
+    data = _json(_anropa("GET", f"/publiceringar/grupp/{kodat}"))
+    return data if isinstance(data, list) else []
+
+
 def hamta_bilaga(fillagring_id: str) -> bytes:
     """GET /bilagor/{lagringId}. Returnerar PDF-filens innehåll."""
     kodat = urllib.parse.quote(fillagring_id, safe="")
