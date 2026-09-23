@@ -709,7 +709,9 @@ async def _hamta_pdf(fillagring_id, avgorande_id=None, filnamn=None,
     log.info("Hämtar PDF: %s", url)
 
     try:
-        resp = requests.get(url, headers={**_HEADERS, "Accept": "application/octet-stream"}, timeout=30)
+        # API:et levererar bilagor som application/pdf och svarar 406 på
+        # andra Accept-värden.
+        resp = requests.get(url, headers={**_HEADERS, "Accept": "application/pdf"}, timeout=30)
         resp.raise_for_status()
         pdf_bytes = resp.content
     except requests.RequestException as e:
