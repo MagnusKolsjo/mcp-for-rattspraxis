@@ -17,17 +17,26 @@ exec >> "$LOG_FIL" 2>&1
 echo
 echo "===== $(date '+%Y-%m-%d %H:%M:%S') — daglig synk startar ====="
 
-# .env exporteras så att PYTHON_SOKVAG och LOGGRADER_BEHALL_DAGAR syns här.
-# Python-skriptet läser .env själv också.
-if [ -f "$SERVER_DIR/.env" ]; then
-    set -a
-    # shellcheck disable=SC1091
-    source "$SERVER_DIR/.env"
-    set +a
-fi
-PYTHON="${PYTHON_SOKVAG:-$SERVER_DIR/.venv/bin/python3}"
+# .env läses inte in med source: värden som DATABASE_URL kan innehålla &, $
+# och citattecken som bash skulle tolka. Python-skriptet läser .env själv
+# med python-dotenv. Här behövs bara två enkla värden, som plockas ut som
+# text utan att köras. En variabel som redan finns i miljön har företräde.
+las_env() {
+    local nyckel="$1" rad varde
+    [ -f "$SERVER_DIR/.env" ] || return 0
+    rad="$(grep -E "^[[:space:]]*${nyckel}=" "$SERVER_DIR/.env" | tail -n 1 || true)"
+    varde="${rad#*=}"
+    varde="${varde%\"}"; varde="${varde#\"}"
+    varde="${varde%\'}"; varde="${varde#\'}"
+    printf '%s' "$varde"
+}
 
-find "$LOG_DIR" -name "synk-*.log" -mtime +"${LOGGRADER_BEHALL_DAGAR:-30}" -delete
+PYTHON="${PYTHON_SOKVAG:-$(las_env PYTHON_SOKVAG)}"
+PYTHON="${PYTHON:-$SERVER_DIR/.venv/bin/python3}"
+BEHALL_DAGAR="${LOGGRADER_BEHALL_DAGAR:-$(las_env LOGGRADER_BEHALL_DAGAR)}"
+BEHALL_DAGAR="${BEHALL_DAGAR:-30}"
+
+find "$LOG_DIR" -name "synk-*.log" -mtime +"$BEHALL_DAGAR" -delete
 
 echo "[$(date '+%H:%M:%S')] Steg 1: publiceringar"
 "$PYTHON" "$SERVER_DIR/01_synka_publiceringar.py" || {

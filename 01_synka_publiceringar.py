@@ -30,11 +30,13 @@ Konfiguration via .env — se config.example.env.
 import argparse
 import logging
 import os
+import shlex
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 from dotenv import load_dotenv
 
@@ -209,11 +211,11 @@ def _installera_launchd(wrapper: Path, cron_schema: str) -> None:
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key><string>{label}</string>
+    <key>Label</key><string>{escape(label)}</string>
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>{wrapper}</string>
+        <string>{escape(str(wrapper))}</string>
     </array>
     <key>StartCalendarInterval</key>
     <dict>
@@ -221,8 +223,8 @@ def _installera_launchd(wrapper: Path, cron_schema: str) -> None:
         <key>Minute</key><integer>{int(minut)}</integer>
     </dict>
     <key>RunAtLoad</key><false/>
-    <key>StandardOutPath</key><string>{_SCRIPT_DIR}/logs/launchd-stdout.log</string>
-    <key>StandardErrorPath</key><string>{_SCRIPT_DIR}/logs/launchd-stderr.log</string>
+    <key>StandardOutPath</key><string>{escape(str(_SCRIPT_DIR))}/logs/launchd-stdout.log</string>
+    <key>StandardErrorPath</key><string>{escape(str(_SCRIPT_DIR))}/logs/launchd-stderr.log</string>
 </dict>
 </plist>
 """
@@ -236,7 +238,8 @@ def _installera_launchd(wrapper: Path, cron_schema: str) -> None:
 
 def _installera_cron(wrapper: Path, cron_schema: str) -> None:
     """Lägger till en rad i användarens crontab, om den inte redan finns."""
-    rad = f"{cron_schema} /bin/bash {wrapper}\n"
+    # Sökvägen citeras: servermappen kan innehålla blanksteg.
+    rad = f"{cron_schema} /bin/bash {shlex.quote(str(wrapper))}\n"
     befintlig = subprocess.run(
         ["crontab", "-l"], capture_output=True, text=True, check=False
     ).stdout

@@ -13,6 +13,8 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
   Första körningen är en fullsynk (drygt 17 000 publiceringar, ungefär 10–15 minuter);
   därefter hämtas bara det som publicerats sedan förra körningen. `synk_daglig.sh`
   kör synken med loggning, och `--installera-schema` lägger in den i launchd eller cron.
+  Wrappern läser inte in `.env` med `source`, så värden med `&`, `$` eller citattecken
+  (t.ex. i `DATABASE_URL`) går bra; sökvägar med blanksteg citeras i cron-raden.
 - **`sok_i_domtext` söker i hela korpusen** efter en fullsynk: benämning, referatnummer,
   sammanfattning, nyckelord och HTML-fulltext för varje lokalt lagrat avgörande, utöver
   PDF-texterna. Varje träff har fältet `kalla` (`avgorande` eller `pdf`), och svaret
