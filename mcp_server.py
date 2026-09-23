@@ -13,24 +13,28 @@ Exponerar sex verktyg:
 Konfiguration via .env-fil — se config.example.env.
 """
 
-import asyncio
 import contextlib
-import json
 import logging
 import os
-import secrets
-import sys
-import urllib.parse
+import threading
 from pathlib import Path
+from typing import Annotated, Any
 
-import requests
 from dotenv import load_dotenv
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp import types
 
-import db
-from db import (
+# .env läses innan db och klient importeras, eftersom de läser sin
+# konfiguration vid import och servern inte ärver klientens shell-miljö.
+_SCRIPT_DIR = Path(__file__).parent.resolve()
+load_dotenv(_SCRIPT_DIR / ".env")
+
+from mcp.server.mcpserver import MCPServer  # noqa: E402
+from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
+from pydantic import Field  # noqa: E402
+from typing_extensions import NotRequired, TypedDict  # noqa: E402
+
+import db  # noqa: E402
+import klient  # noqa: E402
+from db import (  # noqa: E402
     DATABASE_URL as _DATABASE_URL,
     _ar_postgres,
     _hamta_db,
@@ -40,13 +44,12 @@ from db import (
     _las_pdf_cache,
     _skriv_pdf_cache,
 )
+from mcp_annotationer import CACHE_HINTAR, LASNING_DB, LASNING_EXTERN  # noqa: E402
+from mcp_transport import starta  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Inledande inställningar
 # ---------------------------------------------------------------------------
-
-_SCRIPT_DIR = Path(__file__).parent.resolve()
-load_dotenv(_SCRIPT_DIR / ".env")
 
 _LOGS_DIR = _SCRIPT_DIR / "logs"
 _LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -59,8 +62,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-_API_BAS = "https://rattspraxis.etjanst.domstol.se/api/v1"
-
 # Standardtak för domtext i hamta_pdf. Utan ett tak som gäller by default kan ett
 # långt avgörande överskrida MCP-protokollets storleksgräns och misslyckas helt.
 # Anroparen kan alltid höja taket, eller sätta 0 för hela texten.
@@ -69,12 +70,6 @@ RP_MAX_TECKEN = int(os.getenv("RP_MAX_TECKEN", "60000"))
 # Maximalt antal träffar per API-sida — API:et tillåter upp till 50.
 # Värdet är ett designval: 50 balanserar svarstid mot täckning vid paginering.
 _MAX_PER_SIDA = 50
-
-# Projektidentifierande UA enligt projektets UA-konvention. Skickas med på
-# alla anrop mot Domstolsverkets rättspraxis-API.
-_HEADERS = {
-    "User-Agent": "mcp-for-rattspraxis/1.0 (+https://github.com/MagnusKolsjo/mcp-for-rattspraxis)",
-}
 
 # ---------------------------------------------------------------------------
 # Domstolsalias — hanterar historiska namnbyten
@@ -117,7 +112,7 @@ def _expandera_domstolkoder(koder: list[str] | None) -> list[str] | None:
 
 def _tal(n: int) -> str:
     """Heltal med svensk tusentalsavgränsare (hårt blanksteg, U+00A0)."""
-    return f"{n:,}".replace(",", " ")
+    return f"{n:,}".replace(",", " ")
 
 
 def _skar_ut_text(
@@ -162,15 +157,27 @@ def _skar_ut_text(
 
 
 # ---------------------------------------------------------------------------
-# FD 1-skydd — skyddar MCP-protokollet mot C-bindningars stdout-utskrifter
+# PDF-extraktion
 # ---------------------------------------------------------------------------
+#
+# PyMuPDF är inte trådsäkert, och verktygen körs på arbetstrådar. Låset
+# serialiserar extraktionen. Det skyddar också _tysta_fd1, som flyttar
+# processens gemensamma filhandtag: två samtidiga omdirigeringar skulle
+# återställa handtagen i fel ordning.
+
+_pdf_las = threading.Lock()
+
 
 @contextlib.contextmanager
 def _tysta_fd1():
     """
-    Redirigerar FD 1 och FD 2 till loggfil under anrop som kan skriva
-    direkt till filhandtagen (t.ex. pymupdf4llm, Tesseract).
-    Återställer FD-handtagen efteråt så att MCP-protokollet fungerar.
+    Redirigerar FD 1 och FD 2 till loggfil under anrop som skriver direkt
+    till filhandtagen (pymupdf4llm och dess C-bindningar).
+
+    MCP-protokollet skyddas redan av SDK:ns stdio-transport, som läser och
+    skriver på egna kopior av handtagen. Omdirigeringen håller i stället
+    extraktionens utskrifter borta från stderr, som klienten loggar.
+    Anropas bara med _pdf_las taget.
     """
     logg = _LOGS_DIR / "subprocess.log"
     spara_ut = os.dup(1)
@@ -189,23 +196,28 @@ def _tysta_fd1():
 
 
 # ---------------------------------------------------------------------------
-# HTTP-hjälpfunktioner mot Domstolsverkets API
+# Anrop mot källan
 # ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _kalla_som_toolerror():
+    """Visar källans fel som ToolError, så att klienten får isError och orsaken."""
+    try:
+        yield
+    except klient.KallaFel as e:
+        raise ToolError(str(e)) from e
+
 
 def _sok_post(body: dict) -> dict:
     """Anropar POST /api/v1/sok och returnerar svaret som dict."""
-    url = f"{_API_BAS}/sok"
-    r = requests.post(url, json=body, headers=_HEADERS, timeout=15)
-    r.raise_for_status()
-    return r.json()
+    with _kalla_som_toolerror():
+        return klient.sok(body)
 
 
 def _hamta_publicering_api(avgorande_id: str) -> dict:
     """GET /api/v1/publiceringar/{id} — returnerar fullständigt avgörande."""
-    url = f"{_API_BAS}/publiceringar/{avgorande_id}"
-    r = requests.get(url, headers=_HEADERS, timeout=15)
-    r.raise_for_status()
-    return r.json()
+    with _kalla_som_toolerror():
+        return klient.hamta_publicering(avgorande_id)
 
 
 def _satt_datumintervall(filter_: dict, datum_fran: str | None, datum_till: str | None) -> None:
@@ -222,6 +234,14 @@ def _satt_datumintervall(filter_: dict, datum_fran: str | None, datum_till: str 
         intervall["toDatum"] = datum_till
     if intervall:
         filter_["intervall"] = intervall
+
+
+def _satt_vagledande(filter_: dict, ar_vagledande: bool | None) -> None:
+    """API:et saknar filter på "vägledande"; det uttrycks som avgörandetyper."""
+    if ar_vagledande is not None:
+        filter_["avgorandeTypLista"] = (
+            db.VAGLEDANDE_TYPER if ar_vagledande else db.EJ_VAGLEDANDE_TYPER
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +270,7 @@ def _hamta_grupp_kompanjon(avgorande: dict) -> dict | None:
         "antalPerSida": 5,
     }
     try:
-        data = _sok_post(body)
+        data = klient.sok(body)
         for hit in data.get("publiceringLista", []):
             if (
                 hit.get("id") != avgorande.get("id")
@@ -263,33 +283,113 @@ def _hamta_grupp_kompanjon(avgorande: dict) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# Svarstyper
+# ---------------------------------------------------------------------------
+#
+# Fälten speglar API:ets publiceringar. Källan lämnar många fält tomma för
+# äldre referat och för beslut om prövningstillstånd, så allt som inte är
+# garanterat av API:ets schema är typat som nullbart.
+
+class Bilaga(TypedDict):
+    filnamn: str | None
+    fillagring_id: str | None
+
+
+class Avgorande(TypedDict):
+    id: str | None
+    typ: str | None
+    domstol: str | None
+    domstolkod: str | None
+    avgorandedatum: str | None
+    publiceringstid: str | None
+    ar_vagledande: bool | None
+    benamning: str | None
+    sammanfattning: str | None
+    malnummer: list[str]
+    referat_nummer: list[str]
+    nyckelord: list[str]
+    rattsomrade: list[str]
+    lagrum: list[dict[str, Any]]
+    forarbeten: list[str]
+    eu_avgoranden: list[str]
+    hanvisade: list[dict[str, Any]]
+    litteratur: list[dict[str, Any]]
+    ecli_nummer: str | None
+    grupp_id: str | None
+    har_html_fulltext: bool
+    bilagor: list[Bilaga]
+    innehall_html: NotRequired[str | None]
+    info: NotRequired[str]
+
+
+class AvgorandeMedKompanjon(Avgorande):
+    kompanjon: NotRequired[Avgorande | None]
+    sokresultat_antal: NotRequired[int]
+
+
+class Sokresultat(TypedDict):
+    total: int
+    sida: int
+    antal_per_sida: int
+    antal_sidor: int
+    avgoranden: list[Avgorande]
+
+
+class Lagrumsresultat(TypedDict):
+    sfs_nummer: str
+    paragraf_filter: str | None
+    antal_treffar: int
+    avgoranden: list[Avgorande]
+
+
+class Domtexttraff(TypedDict):
+    fillagring_id: str | None
+    avgorande_id: str | None
+    domstolkod: NotRequired[str | None]
+    avgorandedatum: NotRequired[str | None]
+    benamning: NotRequired[str | None]
+    sammanfattning: NotRequired[str | None]
+    filnamn: NotRequired[str | None]
+    relevans: NotRequired[float]
+    utdrag: str | None
+
+
+class Domtextresultat(TypedDict):
+    sokterm: str
+    antal_treffar: int
+    info: NotRequired[str]
+    treffar: list[Domtexttraff]
+
+
+# ---------------------------------------------------------------------------
 # Intern hjälpfunktion: formatering
 # ---------------------------------------------------------------------------
 
 def _formatera_avgorande(a: dict, inkludera_innehall: bool = False) -> dict:
     """Formaterar ett avgörande-objekt till ett lämpligt MCP-svar."""
     har_innehall = bool(a.get("innehall"))
-    bilagor = a.get("bilagaLista", [])
+    bilagor = a.get("bilagaLista") or []
+    domstol = a.get("domstol") or {}
 
     result = {
         "id": a.get("id"),
         "typ": a.get("typ"),
-        "domstol": (a.get("domstol") or {}).get("domstolNamn"),
-        "domstolkod": (a.get("domstol") or {}).get("domstolKod"),
+        "domstol": domstol.get("domstolNamn"),
+        "domstolkod": domstol.get("domstolKod"),
         "avgorandedatum": a.get("avgorandedatum"),
         "publiceringstid": a.get("publiceringstid"),
         "ar_vagledande": db.ar_vagledande(a),
         "benamning": a.get("benamning"),
         "sammanfattning": a.get("sammanfattning"),
-        "malnummer": a.get("malNummerLista", []),
-        "referat_nummer": a.get("referatNummerLista", []),
-        "nyckelord": a.get("nyckelordLista", []),
-        "rattsomrade": a.get("rattsomradeLista", []),
-        "lagrum": a.get("lagrumLista", []),
-        "forarbeten": a.get("forarbeteLista", []),
-        "eu_avgoranden": a.get("europarattsligaAvgorandenLista", []),
-        "hanvisade": a.get("hanvisadePubliceringarLista", []),
-        "litteratur": a.get("litteraturLista", []),
+        "malnummer": a.get("malNummerLista") or [],
+        "referat_nummer": a.get("referatNummerLista") or [],
+        "nyckelord": a.get("nyckelordLista") or [],
+        "rattsomrade": a.get("rattsomradeLista") or [],
+        "lagrum": a.get("lagrumLista") or [],
+        "forarbeten": a.get("forarbeteLista") or [],
+        "eu_avgoranden": a.get("europarattsligaAvgorandenLista") or [],
+        "hanvisade": a.get("hanvisadePubliceringarLista") or [],
+        "litteratur": a.get("litteraturLista") or [],
         "ecli_nummer": a.get("ecliNummer"),
         "grupp_id": a.get("gruppKorrelationsnummer"),
         "har_html_fulltext": har_innehall,
@@ -311,295 +411,87 @@ def _formatera_avgorande(a: dict, inkludera_innehall: bool = False) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# MCP-server och verktygsdeklarationer
+# MCP-server
 # ---------------------------------------------------------------------------
 
-server = Server("rattspraxis")
-
-
-@server.list_tools()
-async def lista_verktyg() -> list[types.Tool]:
-    return [
-        types.Tool(
-            name="sok_rattpraxis",
-            description=(
-                "Söker i Domstolsverkets rättspraxis-databas (~17 500 avgöranden från svenska "
-                "överrätter). Rättsfallsreferat finns från 1981; domar och beslut i fulltext "
-                "finns från mars 2025. Returnerar sammanfattningar, lagrumshänvisningar och "
-                "korsreferenser till förarbeten och EU-domstolsbeslut. "
-                "Använd sfs_nummer för praxis kopplad till en specifik lag, "
-                "domstolkoder=['HDO'] för enbart Högsta domstolens prejudikat."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "fritext": {
-                        "type": "string",
-                        "description": "Fritextsökning — ord AND-kombineras. Exempel: 'skadestånd entreprenad'",
-                    },
-                    "domstolkoder": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": (
-                            "Filtrera på domstol. Koder: HDO (HD), HFD, ADO (AD), "
-                            "MMOD (MÖD), MIOD (Migrationsöverdomstolen), HSV (Svea hovrätt) m.fl. "
-                            "HFD och REGR (Regeringsrätten, t.o.m. 2010) expanderas automatiskt "
-                            "till båda — ange endera för att söka hela beståndet. "
-                            "Detsamma gäller MMOD och MOD (Miljööverdomstolen, t.o.m. 2011)."
-                        ),
-                    },
-                    "ar_vagledande": {
-                        "type": "boolean",
-                        "description": "true = bara prejudikat och vägledande avgöranden",
-                    },
-                    "rattsomrade": {
-                        "type": "string",
-                        "description": (
-                            "Rättsområde. Alternativ: Miljömål, Skatt, Migrationsmål, "
-                            "Brottmål inkl mål om utdömande av vite, Socialförsäkring m.fl."
-                        ),
-                    },
-                    "sfs_nummer": {
-                        "type": "string",
-                        "description": "SFS-nummer för lag, t.ex. '1942:740' (rättegångsbalken)",
-                    },
-                    "datum_fran": {"type": "string", "description": "Från-datum ÅÅÅÅ-MM-DD"},
-                    "datum_till": {"type": "string", "description": "Till-datum ÅÅÅÅ-MM-DD"},
-                    "nyckelord": {
-                        "type": "string",
-                        "description": "Ämnesord från avgörandenas nyckelordslista",
-                    },
-                    "sid_index": {
-                        "type": "integer",
-                        "description": "Sidindex, 0-baserat (standard: 0)",
-                    },
-                    "antal_per_sida": {
-                        "type": "integer",
-                        "description": "Träffar per sida, 1–50 (standard: 10)",
-                    },
-                },
-            },
-        ),
-        types.Tool(
-            name="hamta_avgorande",
-            description=(
-                "Hämtar ett fullständigt avgörande med all metadata: lagrum, "
-                "förarbeteshänvisningar, EU-rättshänvisningar, nyckelord och fulltext (HTML) "
-                "om tillgänglig. HTML-fulltext finns för HFD m.fl. men saknas för HD (HDO) "
-                "och MÖD (MMOD) — använd hamta_pdf för dessa."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "avgorande_id": {
-                        "type": "string",
-                        "description": "Avgörandets UUID (avgorande_id från sok_rattpraxis)",
-                    },
-                    "inkludera_html": {
-                        "type": "boolean",
-                        "description": "Inkludera HTML-fulltext i svaret om tillgänglig (standard: true)",
-                    },
-                    "hamta_kompanjon": {
-                        "type": "boolean",
-                        "description": (
-                            "Hämta även syskonpublicering (DOM_ELLER_BESLUT↔REFERAT med NJA-nummer) "
-                            "om tillgänglig (standard: false)"
-                        ),
-                    },
-                },
-                "required": ["avgorande_id"],
-            },
-        ),
-        types.Tool(
-            name="hamta_pdf",
-            description=(
-                "Hämtar och extraherar text ur PDF-bilagan till ett avgörande. "
-                "Nödvändigt för HD (HDO) och MÖD (MMOD) som saknar HTML-fulltext i API:et. "
-                "Extraherad text cachas lokalt — efterföljande anrop hämtar från cache. "
-                "fillagring_id hämtas från bilagor[].fillagring_id i svaret från hamta_avgorande."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "fillagring_id": {
-                        "type": "string",
-                        "description": (
-                            "Fillagrings-ID från bilagor[].fillagring_id, t.ex. '190/b6/74/uuid'. "
-                            "Snedstrecken URL-kodas automatiskt."
-                        ),
-                    },
-                    "avgorande_id": {
-                        "type": "string",
-                        "description": "UUID för avgörandet — används för att koppla PDF till avgörande i cachen (valfritt)",
-                    },
-                    "filnamn": {
-                        "type": "string",
-                        "description": "Filnamn på PDF:en, t.ex. 'B 712-25.pdf' (valfritt, för cachelogg)",
-                    },
-                    "max_tecken": {
-                        "type": "integer",
-                        "description": (
-                            "Teckentak för den returnerade domtexten (standard 60 000, 0 = hela texten). "
-                            "Sätt ett tak för långa domar så att svaret inte överskrider "
-                            "storleksgränsen. Ett kapat svar avslutas med en rad som anger "
-                            "hur mycket som visas och hur resten hämtas."
-                        ),
-                        "default": 60000,
-                    },
-                    "fran_tecken": {
-                        "type": "integer",
-                        "description": (
-                            "Börja texten vid denna teckenposition — för att läsa vidare "
-                            "där ett kapat svar slutade. Citera aldrig ur ett kapat utdrag."
-                        ),
-                        "default": 0,
-                    },
-                },
-                "required": ["fillagring_id"],
-            },
-        ),
-        types.Tool(
-            name="sok_rattpraxis_for_lagrum",
-            description=(
-                "Söker rättspraxis kopplad till ett specifikt lagrum i en lag. "
-                "Mer precist än sok_rattpraxis(sfs_nummer=...) eftersom det kan filtrera "
-                "på specifik paragraf, t.ex. '36 §' eller '5 kap. 3 §'. "
-                "Hämtar alla träffar för SFS-numret och filtrerar på paragraf."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "sfs_nummer": {
-                        "type": "string",
-                        "description": "SFS-nummer, t.ex. '1962:700' (brottsbalken)",
-                    },
-                    "paragraf": {
-                        "type": "string",
-                        "description": (
-                            "Paragraf att filtrera på, t.ex. '36 §', '5 kap. 3 §'. "
-                            "Partiell matchning — '36 §' matchar även '36 a §'."
-                        ),
-                    },
-                    "ar_vagledande": {
-                        "type": "boolean",
-                        "description": "true = bara prejudikat och vägledande avgöranden",
-                    },
-                    "datum_fran": {"type": "string", "description": "Från-datum ÅÅÅÅ-MM-DD"},
-                    "datum_till": {"type": "string", "description": "Till-datum ÅÅÅÅ-MM-DD"},
-                    "max_antal": {
-                        "type": "integer",
-                        "description": "Max antal träffar (standard: 20, max: 200)",
-                    },
-                },
-                "required": ["sfs_nummer"],
-            },
-        ),
-        types.Tool(
-            name="hamta_avgorande_pa_beteckning",
-            description=(
-                "Hämtar ett avgörande via referensnummer eller kortnamn. Stöder:\n"
-                "• NJA-nummer: 'NJA 2025:67' eller 'NJA 2025 s. 1024'\n"
-                "• HFD-referat: 'HFD 2026 ref. 1'\n"
-                "• MÖD: 'MÖD 2025:51', AD: 'AD 2024 nr 47'\n"
-                "• HD:s kortnamn: '\"Ringa stöld-gränsen II\"'\n"
-                "• Målnummer: 'B 712-25', 'Ö 6478-25'\n"
-                "Returnerar avgörandet med kompanjonpublicering (DOM↔REFERAT) om tillgänglig."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "beteckning": {
-                        "type": "string",
-                        "description": (
-                            "Referensnummer eller kortnamn. Exempel: 'NJA 2025:67', "
-                            "'HFD 2026 ref. 1', '\"Ringa stöld-gränsen II\"', 'B 712-25'"
-                        ),
-                    },
-                    "hamta_kompanjon": {
-                        "type": "boolean",
-                        "description": "Hämta syskonpublicering (DOM↔REFERAT) om tillgänglig (standard: true)",
-                    },
-                },
-                "required": ["beteckning"],
-            },
-        ),
-        types.Tool(
-            name="sok_i_domtext",
-            description=(
-                "Söker fulltext inuti cachade domstolsavgöranden. "
-                "Kräver att domar dessförinnan hämtats med hamta_pdf (texten cachas lokalt). "
-                "Använd för att hitta specifika resonemang, lagcitat eller rättsliga principer "
-                "i domtexterna — kompletterar metadata-sökning med sökning i domskälen. "
-                "PostgreSQL: avancerad FTS med träffrelevans och utdrag. "
-                "SQLite: enklare textsökning."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "sokterm": {
-                        "type": "string",
-                        "description": "Sökterm eller fras att leta efter i domtexterna",
-                    },
-                    "domstolkod": {
-                        "type": "string",
-                        "description": "Filtrera på domstol: HDO, HFD, MMOD m.fl. (valfritt)",
-                    },
-                    "max_antal": {
-                        "type": "integer",
-                        "description": "Max antal träffar (standard: 10, max: 50)",
-                    },
-                },
-                "required": ["sokterm"],
-            },
-        ),
-    ]
-
-
-@server.call_tool()
-async def anropa_verktyg(
-    name: str, arguments: dict | None
-) -> list[types.TextContent]:
-    args = arguments or {}
-    log.info("Verktygsanrop: %s %s", name, list(args.keys()))
-
-    try:
-        if name == "sok_rattpraxis":
-            return await _sok_rattpraxis(**args)
-        elif name == "hamta_avgorande":
-            return await _hamta_avgorande(**args)
-        elif name == "hamta_pdf":
-            return await _hamta_pdf(**args)
-        elif name == "sok_rattpraxis_for_lagrum":
-            return await _sok_rattpraxis_for_lagrum(**args)
-        elif name == "hamta_avgorande_pa_beteckning":
-            return await _hamta_avgorande_pa_beteckning(**args)
-        elif name == "sok_i_domtext":
-            return await _sok_i_domtext(**args)
-        else:
-            return [types.TextContent(type="text", text=f"Okänt verktyg: {name}")]
-    except Exception as e:
-        log.error("Fel i %s: %s", name, e, exc_info=True)
-        return [types.TextContent(type="text", text=f"Fel vid anrop till {name}: {e}")]
+mcp = MCPServer(
+    "rattspraxis",
+    instructions=(
+        "MCP-server för Domstolsverkets rättspraxis-databas: vägledande avgöranden "
+        "från Högsta domstolen, Högsta förvaltningsdomstolen, Arbetsdomstolen, "
+        "Mark- och miljööverdomstolen, Migrationsöverdomstolen, hovrätterna och "
+        "kammarrätterna. Rättsfallsreferat finns från 1981; domar och beslut i "
+        "fulltext från mars 2025.\n\n"
+        "VAR DU BÖRJAR: en känd beteckning (NJA 2025:67, HFD 2026 ref. 1, "
+        "målnummer, HD:s kortnamn) -> hamta_avgorande_pa_beteckning. Praxis om en "
+        "viss paragraf -> sok_rattpraxis_for_lagrum. Allt annat -> sok_rattpraxis, "
+        "sedan hamta_avgorande med id-värdet ur träffen.\n\n"
+        "FULLTEXT: HTML-fulltext finns för de flesta domstolar och för alla "
+        "referat. Domar och beslut från HD och MÖD saknar HTML; läs dem med "
+        "hamta_pdf och fillagring_id ur bilagor[]. En kapad domtext avslutas med "
+        "en rad som anger hur resten hämtas — citera aldrig ur ett kapat utdrag.\n\n"
+        "SÖKNING I DOMTEXTEN: sok_i_domtext söker i den lokala databasen, inte "
+        "hos källan. Den täcker de avgöranden som finns lokalt."
+    ),
+    version="1.2.0",
+    cache_hints=CACHE_HINTAR,
+)
 
 
 # ---------------------------------------------------------------------------
-# Verktygsimplementationer
+# Verktyg
 # ---------------------------------------------------------------------------
 
-async def _sok_rattpraxis(
-    fritext=None,
-    domstolkoder=None,
-    ar_vagledande=None,
-    rattsomrade=None,
-    sfs_nummer=None,
-    datum_fran=None,
-    datum_till=None,
-    nyckelord=None,
-    sid_index=0,
-    antal_per_sida=10,
-):
-    antal_per_sida = min(int(antal_per_sida or 10), _MAX_PER_SIDA)
-    sid_index = int(sid_index or 0)
+_BESKR_AR_VAGLEDANDE = (
+    "true = bara prejudikat och vägledande avgöranden; false = bara avgöranden "
+    "som inte är vägledande och beslut om prövningstillstånd"
+)
+
+
+@mcp.tool(title="Sök i rättspraxis", annotations=LASNING_EXTERN)
+def sok_rattpraxis(
+    fritext: Annotated[str | None, Field(
+        description="Fritextsökning — ord AND-kombineras. Exempel: 'skadestånd entreprenad'",
+    )] = None,
+    domstolkoder: Annotated[list[str] | None, Field(
+        description=(
+            "Filtrera på domstol. Koder: HDO (HD), HFD, ADO (AD), "
+            "MMOD (MÖD), MIOD (Migrationsöverdomstolen), HSV (Svea hovrätt) m.fl. "
+            "HFD och REGR (Regeringsrätten, t.o.m. 2010) expanderas automatiskt "
+            "till båda — ange endera för att söka hela beståndet. "
+            "Detsamma gäller MMOD och MOD (Miljööverdomstolen, t.o.m. 2011)."
+        ),
+    )] = None,
+    ar_vagledande: Annotated[bool | None, Field(description=_BESKR_AR_VAGLEDANDE)] = None,
+    rattsomrade: Annotated[str | None, Field(
+        description=(
+            "Rättsområde. Alternativ: Miljömål, Skatt, Migrationsmål, "
+            "Brottmål inkl mål om utdömande av vite, Socialförsäkring m.fl."
+        ),
+    )] = None,
+    sfs_nummer: Annotated[str | None, Field(
+        description="SFS-nummer för lag, t.ex. '1942:740' (rättegångsbalken)",
+    )] = None,
+    datum_fran: Annotated[str | None, Field(description="Från-datum ÅÅÅÅ-MM-DD")] = None,
+    datum_till: Annotated[str | None, Field(description="Till-datum ÅÅÅÅ-MM-DD")] = None,
+    nyckelord: Annotated[str | None, Field(
+        description="Ämnesord från avgörandenas nyckelordslista",
+    )] = None,
+    sid_index: Annotated[int, Field(description="Sidindex, 0-baserat (standard: 0)")] = 0,
+    antal_per_sida: Annotated[int, Field(
+        description="Träffar per sida, 1–50 (standard: 10)",
+    )] = 10,
+) -> Sokresultat:
+    """
+    Söker i Domstolsverkets rättspraxis-databas (~17 500 avgöranden från svenska
+    överrätter). Rättsfallsreferat finns från 1981; domar och beslut i fulltext
+    finns från mars 2025. Returnerar sammanfattningar, lagrumshänvisningar och
+    korsreferenser till förarbeten och EU-domstolsbeslut. Använd sfs_nummer för
+    praxis kopplad till en specifik lag, domstolkoder=['HDO'] för enbart Högsta
+    domstolens prejudikat.
+    """
+    antal_per_sida = max(1, min(int(antal_per_sida or 10), _MAX_PER_SIDA))
+    sid_index = max(0, int(sid_index or 0))
 
     body = {
         "sokfras": {
@@ -615,11 +507,7 @@ async def _sok_rattpraxis(
     f = body["filter"]
     if domstolkoder:
         f["domstolKodLista"] = _expandera_domstolkoder(domstolkoder)
-    if ar_vagledande is not None:
-        # API:et saknar filter på "vägledande"; det uttrycks som avgörandetyper.
-        f["avgorandeTypLista"] = (
-            db.VAGLEDANDE_TYPER if ar_vagledande else db.EJ_VAGLEDANDE_TYPER
-        )
+    _satt_vagledande(f, ar_vagledande)
     if rattsomrade:
         f["rattsomradeLista"] = [rattsomrade]
     if sfs_nummer:
@@ -629,11 +517,11 @@ async def _sok_rattpraxis(
         f["sokordLista"] = [nyckelord]
 
     data = _sok_post(body)
-    total = data.get("total", 0)
-    treffar = data.get("publiceringLista", [])
+    total = data.get("total") or 0
+    treffar = data.get("publiceringLista") or []
 
     antal_sidor = (total + antal_per_sida - 1) // antal_per_sida if total > 0 else 0
-    resultat = {
+    return {
         "total": total,
         "sida": sid_index + 1,
         "antal_per_sida": antal_per_sida,
@@ -641,11 +529,28 @@ async def _sok_rattpraxis(
         "avgoranden": [_formatera_avgorande(a) for a in treffar],
     }
 
-    return [types.TextContent(type="text", text=json.dumps(resultat, ensure_ascii=False, indent=2))]
 
-
-async def _hamta_avgorande(avgorande_id, inkludera_html=True, hamta_kompanjon=False):
-    # Försök cache först
+@mcp.tool(title="Hämta avgörande", annotations=LASNING_EXTERN)
+def hamta_avgorande(
+    avgorande_id: Annotated[str, Field(
+        description="Avgörandets UUID (avgorande_id från sok_rattpraxis)",
+    )],
+    inkludera_html: Annotated[bool, Field(
+        description="Inkludera HTML-fulltext i svaret om tillgänglig (standard: true)",
+    )] = True,
+    hamta_kompanjon: Annotated[bool, Field(
+        description=(
+            "Hämta även syskonpublicering (DOM_ELLER_BESLUT↔REFERAT med NJA-nummer) "
+            "om tillgänglig (standard: false)"
+        ),
+    )] = False,
+) -> AvgorandeMedKompanjon:
+    """
+    Hämtar ett fullständigt avgörande med all metadata: lagrum,
+    förarbeteshänvisningar, EU-rättshänvisningar, nyckelord och fulltext (HTML)
+    om tillgänglig. HTML-fulltext finns för HFD m.fl. men saknas för HD (HDO)
+    och MÖD (MMOD) — använd hamta_pdf för dessa.
+    """
     a = _las_avgorande_cache(avgorande_id)
     kalla = "cache"
 
@@ -661,10 +566,10 @@ async def _hamta_avgorande(avgorande_id, inkludera_html=True, hamta_kompanjon=Fa
         kompanjon = _hamta_grupp_kompanjon(a)
         result["kompanjon"] = _formatera_avgorande(kompanjon) if kompanjon else None
 
-    return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+    return result
 
 
-def _sakerstall_avgorande_cache(avgorande_id: str):
+def _sakerstall_avgorande_cache(avgorande_id: str | None) -> None:
     """
     Säkerställer att metadata för ett avgörande finns i avgorande_cache.
     Hämtar från API:et om cachen är tom eller utgången.
@@ -677,75 +582,96 @@ def _sakerstall_avgorande_cache(avgorande_id: str):
     if _las_avgorande_cache(avgorande_id) is not None:
         return
     try:
-        a = _hamta_publicering_api(avgorande_id)
+        a = klient.hamta_publicering(avgorande_id)
         _skriv_avgorande_cache(a)
         log.info("Metadata cachad för avgörande %s (via hamta_pdf)", avgorande_id)
     except Exception as e:
         log.warning("Kunde inte cacha metadata för avgörande %s: %s", avgorande_id, e)
 
 
-async def _hamta_pdf(fillagring_id, avgorande_id=None, filnamn=None,
-                     max_tecken=RP_MAX_TECKEN, fran_tecken=0):
+@mcp.tool(title="Hämta domtext ur PDF", annotations=LASNING_EXTERN, structured_output=False)
+def hamta_pdf(
+    fillagring_id: Annotated[str, Field(
+        description=(
+            "Fillagrings-ID från bilagor[].fillagring_id, t.ex. '190/b6/74/uuid'. "
+            "Snedstrecken URL-kodas automatiskt."
+        ),
+    )],
+    avgorande_id: Annotated[str | None, Field(
+        description=(
+            "UUID för avgörandet — används för att koppla PDF till avgörande i "
+            "cachen (valfritt)"
+        ),
+    )] = None,
+    filnamn: Annotated[str | None, Field(
+        description="Filnamn på PDF:en, t.ex. 'B 712-25.pdf' (valfritt, för cachelogg)",
+    )] = None,
+    max_tecken: Annotated[int, Field(
+        description=(
+            "Teckentak för den returnerade domtexten (standard 60 000, 0 = hela texten). "
+            "Sätt ett tak för långa domar så att svaret inte överskrider "
+            "storleksgränsen. Ett kapat svar avslutas med en rad som anger "
+            "hur mycket som visas och hur resten hämtas."
+        ),
+    )] = RP_MAX_TECKEN,
+    fran_tecken: Annotated[int, Field(
+        description=(
+            "Börja texten vid denna teckenposition — för att läsa vidare "
+            "där ett kapat svar slutade. Citera aldrig ur ett kapat utdrag."
+        ),
+    )] = 0,
+) -> str:
+    """
+    Hämtar och extraherar text ur PDF-bilagan till ett avgörande. Nödvändigt för
+    HD (HDO) och MÖD (MMOD) som saknar HTML-fulltext i API:et. Extraherad text
+    cachas lokalt — efterföljande anrop hämtar från cache. fillagring_id hämtas
+    från bilagor[].fillagring_id i svaret från hamta_avgorande.
+    """
     def _anvisning(fran_ny):
         return (
             f'Läs vidare: hamta_pdf(fillagring_id="{fillagring_id}", '
             f"fran_tecken={fran_ny})"
         )
 
-    # Försök cache först
     cachad_text = _las_pdf_cache(fillagring_id)
     if cachad_text:
         log.info("hamta_pdf %s — returnerar från cache", fillagring_id)
         # Retroaktiv metadata-fyllning: säkerställ att avgorande_cache är
-        # populerad även för PDF:er som cachades innan denna fix.
+        # populerad även för PDF:er som cachades utan metadata.
         _sakerstall_avgorande_cache(avgorande_id)
-        return [types.TextContent(
-            type="text",
-            text=_skar_ut_text(cachad_text, max_tecken, fran_tecken,
-                               _anvisning(fran_tecken + max_tecken)),
-        )]
+        return _skar_ut_text(cachad_text, max_tecken, fran_tecken,
+                             _anvisning(fran_tecken + max_tecken))
 
-    # Importera pymupdf4llm (lazy — krävs bara när PDF-hämtning sker)
+    # pymupdf4llm importeras först här — det krävs bara när en PDF hämtas.
     try:
         import fitz
         import pymupdf4llm
-    except ImportError:
-        return [types.TextContent(
-            type="text",
-            text=(
-                "pymupdf4llm är inte installerat. "
-                "Kör: pip install pymupdf4llm\n"
-                "Starta om MCP-servern efteråt."
-            ),
-        )]
+    except ImportError as e:
+        raise ToolError(
+            "pymupdf4llm är inte installerat. Kör: pip install pymupdf4llm "
+            "och starta om MCP-servern."
+        ) from e
 
-    # Hämta PDF från Domstolsverkets API
-    kodad_id = urllib.parse.quote(fillagring_id, safe="")
-    url = f"{_API_BAS}/bilagor/{kodad_id}"
-    log.info("Hämtar PDF: %s", url)
+    log.info("Hämtar PDF: %s", fillagring_id)
+    with _kalla_som_toolerror():
+        pdf_bytes = klient.hamta_bilaga(fillagring_id)
 
     try:
-        # API:et levererar bilagor som application/pdf och svarar 406 på
-        # andra Accept-värden.
-        resp = requests.get(url, headers={**_HEADERS, "Accept": "application/pdf"}, timeout=30)
-        resp.raise_for_status()
-        pdf_bytes = resp.content
-    except requests.RequestException as e:
-        log.error("Fel vid PDF-hämtning från %s: %s", url, e)
-        return [types.TextContent(type="text", text=f"Fel vid PDF-hämtning: {e}")]
-
-    # Extrahera text — FD 1 skyddas mot C-bindningarnas utskrifter
-    try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        with _tysta_fd1():
-            markdown_text = pymupdf4llm.to_markdown(doc)
-        doc.close()
+        with _pdf_las:
+            dok = fitz.open(stream=pdf_bytes, filetype="pdf")
+            try:
+                with _tysta_fd1():
+                    markdown_text = pymupdf4llm.to_markdown(dok)
+            finally:
+                dok.close()
         log.info("PDF extraherad: %d tecken, %d bytes", len(markdown_text), len(pdf_bytes))
     except Exception as e:
-        log.error("Fel vid PDF-extraktion: %s", e)
-        return [types.TextContent(type="text", text=f"Fel vid PDF-extraktion: {e}")]
+        log.error("Fel vid PDF-extraktion av %s: %s", fillagring_id, e)
+        raise ToolError(
+            f"Texten i PDF:en '{fillagring_id}' kunde inte extraheras ({e}). "
+            "Filen kan vara skadad eller bara innehålla inskannade bilder."
+        ) from e
 
-    # Cacha för framtida anrop
     _skriv_pdf_cache(
         fillagring_id=fillagring_id,
         text_md=markdown_text,
@@ -759,22 +685,35 @@ async def _hamta_pdf(fillagring_id, avgorande_id=None, filnamn=None,
     _sakerstall_avgorande_cache(avgorande_id)
 
     # Cachen har alltid hela texten — trunkeringen gäller bara svaret.
-    return [types.TextContent(
-        type="text",
-        text=_skar_ut_text(markdown_text, max_tecken, fran_tecken,
-                           _anvisning(fran_tecken + max_tecken)),
-    )]
+    return _skar_ut_text(markdown_text, max_tecken, fran_tecken,
+                         _anvisning(fran_tecken + max_tecken))
 
 
-async def _sok_rattpraxis_for_lagrum(
-    sfs_nummer,
-    paragraf=None,
-    ar_vagledande=None,
-    datum_fran=None,
-    datum_till=None,
-    max_antal=20,
-):
-    max_antal = min(int(max_antal or 20), 200)
+@mcp.tool(title="Sök praxis för lagrum", annotations=LASNING_EXTERN)
+def sok_rattpraxis_for_lagrum(
+    sfs_nummer: Annotated[str, Field(
+        description="SFS-nummer, t.ex. '1962:700' (brottsbalken)",
+    )],
+    paragraf: Annotated[str | None, Field(
+        description=(
+            "Paragraf att filtrera på, t.ex. '36 §', '5 kap. 3 §'. "
+            "Partiell matchning — '36 §' matchar även '36 a §'."
+        ),
+    )] = None,
+    ar_vagledande: Annotated[bool | None, Field(description=_BESKR_AR_VAGLEDANDE)] = None,
+    datum_fran: Annotated[str | None, Field(description="Från-datum ÅÅÅÅ-MM-DD")] = None,
+    datum_till: Annotated[str | None, Field(description="Till-datum ÅÅÅÅ-MM-DD")] = None,
+    max_antal: Annotated[int, Field(
+        description="Max antal träffar (standard: 20, max: 200)",
+    )] = 20,
+) -> Lagrumsresultat:
+    """
+    Söker rättspraxis kopplad till ett specifikt lagrum i en lag. Mer precist än
+    sok_rattpraxis(sfs_nummer=...) eftersom det kan filtrera på specifik
+    paragraf, t.ex. '36 §' eller '5 kap. 3 §'. Hämtar alla träffar för
+    SFS-numret och filtrerar på paragraf.
+    """
+    max_antal = max(1, min(int(max_antal or 20), 200))
     para_filter = (paragraf or "").lower().strip()
 
     body = {
@@ -786,31 +725,24 @@ async def _sok_rattpraxis_for_lagrum(
     }
 
     f = body["filter"]
-    if ar_vagledande is not None:
-        # API:et saknar filter på "vägledande"; det uttrycks som avgörandetyper.
-        f["avgorandeTypLista"] = (
-            db.VAGLEDANDE_TYPER if ar_vagledande else db.EJ_VAGLEDANDE_TYPER
-        )
+    _satt_vagledande(f, ar_vagledande)
     _satt_datumintervall(f, datum_fran, datum_till)
 
-    # Notera: sok_rattpraxis_for_lagrum filtrerar inte på domstol via API —
-    # domstolsfiltrering kan läggas till som parameter i framtida version om behov uppstår
-
-    alla = []
+    alla: list[dict] = []
     sid = 0
 
     while len(alla) < max_antal:
         body["sidIndex"] = sid
         data = _sok_post(body)
-        treffar = data.get("publiceringLista", [])
-        total = data.get("total", 0)
+        treffar = data.get("publiceringLista") or []
+        total = data.get("total") or 0
 
         if not treffar:
             break
 
         if para_filter:
             for a in treffar:
-                for lagrum in a.get("lagrumLista", []):
+                for lagrum in a.get("lagrumLista") or []:
                     # Kontrollera att paragrafen tillhör rätt SFS-nummer, inte
                     # ett annat lagrum i samma avgörande med liknande paragrafbeteckning.
                     if (
@@ -829,18 +761,38 @@ async def _sok_rattpraxis_for_lagrum(
 
     alla = alla[:max_antal]
 
-    resultat = {
+    return {
         "sfs_nummer": sfs_nummer,
         "paragraf_filter": paragraf,
         "antal_treffar": len(alla),
         "avgoranden": [_formatera_avgorande(a) for a in alla],
     }
 
-    return [types.TextContent(type="text", text=json.dumps(resultat, ensure_ascii=False, indent=2))]
 
-
-async def _hamta_avgorande_pa_beteckning(beteckning, hamta_kompanjon=True):
+@mcp.tool(title="Hämta avgörande på beteckning", annotations=LASNING_EXTERN)
+def hamta_avgorande_pa_beteckning(
+    beteckning: Annotated[str, Field(
+        description=(
+            "Referensnummer eller kortnamn. Exempel: 'NJA 2025:67', "
+            "'HFD 2026 ref. 1', '\"Ringa stöld-gränsen II\"', 'B 712-25'"
+        ),
+    )],
+    hamta_kompanjon: Annotated[bool, Field(
+        description="Hämta syskonpublicering (DOM↔REFERAT) om tillgänglig (standard: true)",
+    )] = True,
+) -> AvgorandeMedKompanjon:
+    """
+    Hämtar ett avgörande via referensnummer eller kortnamn. Stöder:
+    • NJA-nummer: 'NJA 2025:67' eller 'NJA 2025 s. 1024'
+    • HFD-referat: 'HFD 2026 ref. 1'
+    • MÖD: 'MÖD 2025:51', AD: 'AD 2024 nr 47'
+    • HD:s kortnamn: '"Ringa stöld-gränsen II"'
+    • Målnummer: 'B 712-25', 'Ö 6478-25'
+    Returnerar avgörandet med kompanjonpublicering (DOM↔REFERAT) om tillgänglig.
+    """
     beteckning = (beteckning or "").strip()
+    if not beteckning:
+        raise ToolError("Ange en beteckning, t.ex. 'NJA 2025:67' eller 'B 712-25'.")
 
     # Steg 1: exaktFras-sökning (hanterar NJA-nummer, HFD-ref, kortnamn)
     body = {
@@ -851,7 +803,7 @@ async def _hamta_avgorande_pa_beteckning(beteckning, hamta_kompanjon=True):
         "antalPerSida": 10,
     }
     data = _sok_post(body)
-    treffar = data.get("publiceringLista", [])
+    treffar = data.get("publiceringLista") or []
 
     # Steg 2: AND-sökning som reservväg
     if not treffar:
@@ -859,17 +811,13 @@ async def _hamta_avgorande_pa_beteckning(beteckning, hamta_kompanjon=True):
         if ord_lista:
             body["sokfras"] = {"andLista": ord_lista, "exaktFras": None}
             data = _sok_post(body)
-            treffar = data.get("publiceringLista", [])
+            treffar = data.get("publiceringLista") or []
 
     if not treffar:
-        return [types.TextContent(
-            type="text",
-            text=json.dumps({
-                "beteckning": beteckning,
-                "hittades": False,
-                "meddelande": f"Inga avgöranden hittades för '{beteckning}'.",
-            }, ensure_ascii=False),
-        )]
+        raise ToolError(
+            f"Inga avgöranden hittades för '{beteckning}'. Kontrollera beteckningen, "
+            "eller sök bredare med sok_rattpraxis(fritext=...)."
+        )
 
     huvud = treffar[0]
 
@@ -877,9 +825,10 @@ async def _hamta_avgorande_pa_beteckning(beteckning, hamta_kompanjon=True):
     a = _las_avgorande_cache(huvud["id"])
     if a is None:
         try:
-            a = _hamta_publicering_api(huvud["id"])
+            a = klient.hamta_publicering(huvud["id"])
             _skriv_avgorande_cache(a)
-        except Exception:
+        except klient.KallaFel as e:
+            log.warning("Kunde inte hämta hela avgörandet %s: %s", huvud["id"], e)
             a = huvud
 
     result = _formatera_avgorande(a, inkludera_innehall=True)
@@ -905,22 +854,49 @@ async def _hamta_avgorande_pa_beteckning(beteckning, hamta_kompanjon=True):
 
         result["kompanjon"] = _formatera_avgorande(kompanjon) if kompanjon else None
 
-    return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+    return result
 
 
-async def _sok_i_domtext(sokterm, domstolkod=None, max_antal=10):
-    max_antal = min(int(max_antal or 10), 50)
+@mcp.tool(title="Sök i cachade domtexter", annotations=LASNING_DB)
+def sok_i_domtext(
+    sokterm: Annotated[str, Field(
+        description="Sökterm eller fras att leta efter i domtexterna",
+    )],
+    domstolkod: Annotated[str | None, Field(
+        description="Filtrera på domstol: HDO, HFD, MMOD m.fl. (valfritt)",
+    )] = None,
+    max_antal: Annotated[int, Field(
+        description="Max antal träffar (standard: 10, max: 50)",
+    )] = 10,
+) -> Domtextresultat:
+    """
+    Söker fulltext inuti cachade domstolsavgöranden. Kräver att domar
+    dessförinnan hämtats med hamta_pdf (texten cachas lokalt). Använd för att
+    hitta specifika resonemang, lagcitat eller rättsliga principer i
+    domtexterna — kompletterar metadata-sökning med sökning i domskälen.
+    PostgreSQL: avancerad FTS med träffrelevans och utdrag. SQLite: enklare
+    textsökning.
+    """
+    max_antal = max(1, min(int(max_antal or 10), 50))
     # Expandera domstolkod till historiska alias (HFD↔REGR, MMOD↔MOD)
     domstolkoder_expanded = _expandera_domstolkoder([domstolkod]) if domstolkod else None
 
     if not _DATABASE_URL:
-        return [types.TextContent(
-            type="text",
-            text="sok_i_domtext kräver en konfigurerad DATABASE_URL i .env-filen.",
-        )]
+        raise ToolError(
+            "sok_i_domtext kräver en databas. Ange DATABASE_URL i .env "
+            "(PostgreSQL eller SQLite) och starta om servern."
+        )
 
     try:
         conn = _hamta_db()
+    except Exception as e:
+        log.error("sok_i_domtext: databasen gick inte att öppna: %s", e)
+        raise ToolError(
+            "Databasen i DATABASE_URL gick inte att nå. Kontrollera att "
+            "databasservern är igång och försök igen."
+        ) from e
+
+    try:
         cur = conn.cursor()
 
         if _ar_postgres():
@@ -963,9 +939,8 @@ async def _sok_i_domtext(sokterm, domstolkod=None, max_antal=10):
             cur.execute(fraga, params)
             rader = cur.fetchall()
 
-            treffar = []
-            for rad in rader:
-                treffar.append({
+            treffar = [
+                {
                     "fillagring_id": rad[0],
                     "avgorande_id": rad[1],
                     "domstolkod": rad[2],
@@ -974,7 +949,9 @@ async def _sok_i_domtext(sokterm, domstolkod=None, max_antal=10):
                     "sammanfattning": rad[5],
                     "relevans": float(rad[6]) if rad[6] else 0.0,
                     "utdrag": rad[7],
-                })
+                }
+                for rad in rader
+            ]
 
         else:
             # SQLite — enkel LIKE-sökning
@@ -1002,128 +979,34 @@ async def _sok_i_domtext(sokterm, domstolkod=None, max_antal=10):
             """, [sokterm] + params_sqlite)
             rader = cur.fetchall()
 
-            treffar = []
-            for rad in rader:
-                treffar.append({
+            treffar = [
+                {
                     "fillagring_id": rad[0],
                     "avgorande_id": rad[1],
                     "filnamn": rad[2],
                     "utdrag": rad[3],
-                })
-
-        conn.close()
-
-        resultat = {
-            "sokterm": sokterm,
-            "antal_treffar": len(treffar),
-            "info": (
-                "Söker bara i domar som tidigare hämtats med hamta_pdf."
-                if not treffar else None
-            ),
-            "treffar": treffar,
-        }
-        if treffar:
-            del resultat["info"]
-
-        return [types.TextContent(type="text", text=json.dumps(resultat, ensure_ascii=False, indent=2))]
-
+                }
+                for rad in rader
+            ]
     except Exception as e:
         log.error("Fel i sok_i_domtext: %s", e, exc_info=True)
-        return [types.TextContent(type="text", text=f"Fel vid textsökning: {e}")]
+        raise ToolError(f"Sökningen i den lokala databasen misslyckades: {e}") from e
+    finally:
+        conn.close()
+
+    resultat: Domtextresultat = {
+        "sokterm": sokterm,
+        "antal_treffar": len(treffar),
+        "treffar": treffar,
+    }
+    if not treffar:
+        resultat["info"] = "Söker bara i domar som tidigare hämtats med hamta_pdf."
+    return resultat
 
 
 # ---------------------------------------------------------------------------
-# Transporter
+# Uppstart
 # ---------------------------------------------------------------------------
-
-async def _kora_stdio():
-    async with stdio_server() as (las, skriv):
-        await server.run(las, skriv, server.create_initialization_options())
-
-
-def _starta_http():
-    """
-    Startar HTTP-transport via StreamableHTTP-protokollet med valfri
-    Bearer-token-autentisering.
-
-    Servern lyssnar på /mcp och hanterar sessioner via
-    StreamableHTTPSessionManager. Lifespan-kontexthanteraren säkerställer
-    att session manager startas och stängs ned korrekt med Starlette.
-    """
-    from starlette.applications import Starlette
-    from starlette.middleware import Middleware
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.responses import PlainTextResponse
-    from starlette.routing import Mount
-    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-    import uvicorn
-
-    api_nyckel = os.getenv("MCP_API_KEY", "")
-    host = os.getenv("MCP_HOST", "127.0.0.1")
-    port = int(os.getenv("MCP_PORT", "8005"))
-
-    session_manager = StreamableHTTPSessionManager(server)
-
-    @contextlib.asynccontextmanager
-    async def lifespan(app):
-        async with session_manager.run():
-            yield
-
-    async def hantera_mcp(scope, receive, send):
-        await session_manager.handle_request(scope, receive, send)
-
-    middleware_lista = []
-    if api_nyckel:
-        log.info("API-nyckelautentisering aktiverad")
-
-        class BearerKontroll(BaseHTTPMiddleware):
-            async def dispatch(self, request, call_next):
-                token = (
-                    request.headers.get("Authorization", "")
-                    .removeprefix("Bearer ")
-                    .strip()
-                )
-                # secrets.compare_digest ger konstant-tidsjämförelse (skyddar mot timing-attack).
-                if not secrets.compare_digest(token, api_nyckel):
-                    return PlainTextResponse(
-                        "Obehörig: ogiltig eller saknad API-nyckel.", status_code=401
-                    )
-                return await call_next(request)
-
-        middleware_lista = [Middleware(BearerKontroll)]
-    else:
-        log.warning(
-            "MCP_API_KEY är inte satt — servern körs utan autentisering. "
-            "Bind enbart till loopback (MCP_HOST=127.0.0.1) eller "
-            "skydda via reverse proxy."
-        )
-
-    app = Starlette(
-        lifespan=lifespan,
-        routes=[Mount("/mcp", app=hantera_mcp)],
-        middleware=middleware_lista,
-    )
-
-    log.info("Startar HTTP-transport på %s:%s", host, port)
-    uvicorn.run(app, host=host, port=port, log_level="info")
-
-
-def main():
-    try:
-        _sakerstall_schema()
-    except Exception as e:
-        log.warning("Schema-init misslyckades (%s) — servern startar ändå.", e)
-
-    transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
-    if transport == "stdio":
-        log.info("Startar rattspraxis MCP-server (stdio)")
-        asyncio.run(_kora_stdio())
-    elif transport == "http":
-        _starta_http()
-    else:
-        log.error("Okänt MCP_TRANSPORT: %s", transport)
-        sys.exit(1)
-
 
 if __name__ == "__main__":
-    main()
+    starta(mcp, standardport=8005, initiera=_sakerstall_schema)
