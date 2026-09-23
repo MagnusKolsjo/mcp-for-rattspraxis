@@ -72,6 +72,8 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 - `hamta_pdf` fick 406 från API:et för varje PDF som inte redan låg i cachen, eftersom
   bilagor begärdes som `application/octet-stream` i stället för `application/pdf`.
 - Ett okänt `avgorande_id` gav ett JSON-tolkningsfel; API:et svarar med tom kropp.
+- Ett databasfel i `sok_i_domtext` visas som ett begripligt fel; databasens eget
+  felmeddelande loggas i stället för att skickas till klienten.
 - `DATABASE_URL=sqlite:////absolut/sökväg.db` tolkades som en sökväg relativt
   servermappen.
 

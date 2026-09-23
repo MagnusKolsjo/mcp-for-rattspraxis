@@ -1207,8 +1207,15 @@ def sok_i_domtext(
         else:
             rader = _sok_domtext_sqlite(cur, sokterm, domstolkoder, max_antal * 2)
     except Exception as e:
+        # Detaljen loggas; databasens råa felmeddelande säger inget användbart
+        # för användaren och kan röja schema och tabellnamn.
         log.error("Fel i sok_i_domtext: %s", e, exc_info=True)
-        raise ToolError(f"Sökningen i den lokala databasen misslyckades: {e}") from e
+        raise ToolError(
+            "Sökningen i den lokala databasen misslyckades. Databasschemat kan "
+            "sakna de senaste tilläggen: starta om servern så att schemat "
+            "uppdateras, och försök igen. Kvarstår felet finns detaljerna i "
+            "logs/mcp_server.log."
+        ) from e
     finally:
         conn.close()
 
