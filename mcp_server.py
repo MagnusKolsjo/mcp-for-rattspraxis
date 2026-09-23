@@ -18,7 +18,7 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Callable
 
 from dotenv import load_dotenv
 
@@ -119,7 +119,7 @@ def _skar_ut_text(
     text: str,
     max_tecken: int,
     fran_tecken: int = 0,
-    anvisning: str = "",
+    anvisning: Callable[[int], str] | None = None,
 ) -> str:
     """
     Skär ut ett textutdrag och markera alltid när något kapats.
@@ -130,6 +130,12 @@ def _skar_ut_text(
     mycket som visas av hur mycket, och hur resten hämtas.
 
     max_tecken <= 0 betyder ingen trunkering. Klipper på ord- eller radgräns.
+
+    `anvisning` får utdragets faktiska slutposition och returnerar raden om hur
+    man läser vidare. Positionen måste komma härifrån: kapningen på ordgräns gör
+    utdraget kortare än max_tecken, och en fortsättning vid fran_tecken +
+    max_tecken skulle hoppa över det avkapade ordet. Det sista utdraget får
+    ingen läs vidare-rad.
     """
     text   = text or ""
     totalt = len(text)
@@ -142,7 +148,9 @@ def _skar_ut_text(
         brytpunkt = max(utdrag.rfind(" "), utdrag.rfind("\n"))
         if brytpunkt > max_tecken * 0.6:
             utdrag = utdrag[:brytpunkt]
-        utdrag = utdrag.rstrip()
+        # Ett utdrag som bara består av blanktecken skulle ge slut == start,
+        # och läs vidare-raden skulle då peka på samma ställe igen.
+        utdrag = utdrag.rstrip() or rest[:max_tecken]
     else:
         utdrag = rest
 
@@ -151,8 +159,8 @@ def _skar_ut_text(
 
     slut  = start + len(utdrag)
     noter = [f"Visar tecken {_tal(start + 1)}–{_tal(slut)} av {_tal(totalt)}"]
-    if anvisning:
-        noter.append(anvisning)
+    if kapad and anvisning is not None:
+        noter.append(anvisning(slut))
     return utdrag + "\n\n[" + ". ".join(noter) + "]"
 
 
@@ -725,11 +733,13 @@ def hamta_pdf(
     cachas lokalt — efterföljande anrop hämtar från cache. fillagring_id hämtas
     från bilagor[].fillagring_id i svaret från hamta_avgorande.
     """
-    def _anvisning(fran_ny):
-        return (
-            f'Läs vidare: hamta_pdf(fillagring_id="{fillagring_id}", '
-            f"fran_tecken={fran_ny})"
-        )
+    def _anvisning(slut: int) -> str:
+        # Ett komplett anrop: samma pdf, samma tak, från utdragets faktiska slut.
+        argument = [f'fillagring_id="{fillagring_id}"']
+        if avgorande_id:
+            argument.append(f'avgorande_id="{avgorande_id}"')
+        argument += [f"max_tecken={max_tecken}", f"fran_tecken={slut}"]
+        return f"Läs vidare: hamta_pdf({', '.join(argument)})"
 
     cachad_text = _las_pdf_cache(fillagring_id)
     if cachad_text:
@@ -737,8 +747,7 @@ def hamta_pdf(
         # Retroaktiv metadata-fyllning: säkerställ att avgorande_cache är
         # populerad även för PDF:er som cachades utan metadata.
         _sakerstall_avgorande_cache(avgorande_id)
-        return _skar_ut_text(cachad_text, max_tecken, fran_tecken,
-                             _anvisning(fran_tecken + max_tecken))
+        return _skar_ut_text(cachad_text, max_tecken, fran_tecken, _anvisning)
 
     # pymupdf4llm importeras först här — det krävs bara när en PDF hämtas.
     try:
@@ -783,8 +792,7 @@ def hamta_pdf(
     _sakerstall_avgorande_cache(avgorande_id)
 
     # Cachen har alltid hela texten — trunkeringen gäller bara svaret.
-    return _skar_ut_text(markdown_text, max_tecken, fran_tecken,
-                         _anvisning(fran_tecken + max_tecken))
+    return _skar_ut_text(markdown_text, max_tecken, fran_tecken, _anvisning)
 
 
 @mcp.tool(title="Sök praxis för lagrum", annotations=LASNING_EXTERN)

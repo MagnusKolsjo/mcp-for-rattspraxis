@@ -46,6 +46,12 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 
 ### Rättat
 
+- Läs vidare-raden i ett kapat svar från `hamta_pdf` pekade på
+  `fran_tecken + max_tecken`. Kapningen sker på ordgräns, så nästa utdrag hoppade
+  över det avkapade ordet, och med `fran_tecken` nära slutet pekade raden bortom
+  texten. Raden anger nu utdragets faktiska slut och är ett komplett anrop med
+  `fillagring_id`, `max_tecken` och, när det angetts, `avgorande_id`. Det sista
+  utdraget har ingen läs vidare-rad.
 - `datum_fran` och `datum_till` i `sok_rattpraxis` och `sok_rattpraxis_for_lagrum`
   ignorerades av API:et, som läser datumen ur `filter.intervall`. Sökningarna var i
   praktiken ofiltrerade i tid.
