@@ -3,6 +3,66 @@
 Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Tillagt
+
+- **Daglig synk av hela korpusen.** `01_synka_publiceringar.py` hämtar Domstolsverkets
+  publiceringar via `GET /publiceringar` (sorterat på publiceringstid, med
+  `publicerad_fran_och_med` och sidindelning) och lagrar dem i `avgorande_cache`.
+  Första körningen är en fullsynk (drygt 17 000 publiceringar, ungefär 10–15 minuter);
+  därefter hämtas bara det som publicerats sedan förra körningen. `synk_daglig.sh`
+  kör synken med loggning, och `--installera-schema` lägger in den i launchd eller cron.
+- **`sok_i_domtext` söker i hela korpusen** efter en fullsynk: benämning, referatnummer,
+  sammanfattning, nyckelord och HTML-fulltext för varje lokalt lagrat avgörande, utöver
+  PDF-texterna. Varje träff har fältet `kalla` (`avgorande` eller `pdf`), och svaret
+  har fältet `tackning` som visar hur mycket av korpusen som finns lokalt.
+- **Sökförfiningar i `sok_rattpraxis`.** Den nya valfria parametern `forfiningar`
+  (standard `false`) ger fältet `forfiningar`: antal träffar per domstol, SFS-nummer,
+  rättsområde, nyckelord, avgörandetyp och publiceringsform, via `POST /sokforfiningar`.
+- Verktygen har titlar, MCP-annotationer (alla är läsande) och utdataschema; svaren
+  skickas även som `structuredContent`. `hamta_pdf` returnerar domtexten som ren text.
+
+### Ändrat
+
+- **Brytande:** servern kräver `mcp>=2.0,<3` och bygger på `MCPServer`.
+- **Brytande:** http-läget kräver `MCP_API_KEY`. Utan nyckel startar servern inte
+  (exitkod 2); tidigare startade den utan autentisering med en varning. Fel nyckel ger
+  403, saknad header 401.
+- **Brytande:** förväntade fel returneras som verktygsfel (`isError`) i stället för som
+  text i ett lyckat svar. Det gäller bland annat okänt `avgorande_id`,
+  `hamta_avgorande_pa_beteckning` utan träff (tidigare `{"hittades": false, ...}`),
+  PDF-fel och källan som inte svarar.
+- Kompanjonen (dom eller beslut ↔ referat) hämtas via `GET /publiceringar/grupp/{id}`
+  i stället för en sökning på benämningen. Avgöranden utan benämning, som de flesta från
+  HFD, får nu också sin kompanjon.
+- `sok_i_domtext` med SQLite returnerar samma fält som med PostgreSQL (utom `relevans`).
+- Anropen mot källan är samlade i `klient.py`.
+- PDF-extraktionen körs under ett lås, eftersom verktygen körs på arbetstrådar och
+  PyMuPDF inte är trådsäkert.
+- Databasschemat: kolumnen `sokbar_text` (med GIN-index i PostgreSQL) i
+  `avgorande_cache` och tabellen `synk_status`, som migrationer. Befintliga rader fylls
+  i vid första start.
+
+### Rättat
+
+- `datum_fran` och `datum_till` i `sok_rattpraxis` och `sok_rattpraxis_for_lagrum`
+  ignorerades av API:et, som läser datumen ur `filter.intervall`. Sökningarna var i
+  praktiken ofiltrerade i tid.
+- `ar_vagledande` ignorerades som filter (API:et har inget sådant fält) och var alltid
+  `null` i svaren. Det uttrycks nu som avgörandetyp: prejudikat och vägledande
+  avgöranden mot ej vägledande avgöranden och beslut om prövningstillstånd.
+- `hamta_pdf` fick 406 från API:et för varje PDF som inte redan låg i cachen, eftersom
+  bilagor begärdes som `application/octet-stream` i stället för `application/pdf`.
+- Ett okänt `avgorande_id` gav ett JSON-tolkningsfel; API:et svarar med tom kropp.
+- `DATABASE_URL=sqlite:////absolut/sökväg.db` tolkades som en sökväg relativt
+  servermappen.
+
+### Borttaget
+
+- Den egna Starlette-appen för http-läget; transporten sköts av `mcp_transport.py`.
+- `starlette` och `uvicorn` som egna rader i `requirements.txt` (de följer med `mcp`).
+
 ## [1.2.0] — 2026-08-10
 
 ### Tillagt

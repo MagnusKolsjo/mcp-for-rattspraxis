@@ -6,16 +6,20 @@ En MCP-server som ger AI-verktyg med stöd för MCP-protokollet tillgång till D
 
 Servern exponerar sex verktyg:
 
-- **sok_rattpraxis** — söker i hela rättspraxis-databasen med filter på domstol, datum, SFS-nummer och rättsområde
-- **hamta_avgorande** — hämtar ett fullständigt avgörande med metadata, lagrum, förarbeteshänvisningar och EU-rättshänvisningar
+- **sok_rattpraxis** — söker i hela rättspraxis-databasen med filter på domstol, datum, SFS-nummer, rättsområde och nyckelord. Med `forfiningar=true` redovisas också hur träffarna fördelar sig på domstolar, lagar, rättsområden, nyckelord, avgörandetyper och publiceringsformer, med antal per värde — underlag för att snäva in en bred sökning
+- **hamta_avgorande** — hämtar ett fullständigt avgörande med metadata, lagrum, förarbeteshänvisningar och EU-rättshänvisningar, och vid behov syskonpubliceringen (dom eller beslut ↔ referat)
 - **hamta_pdf** — hämtar och extraherar text ur PDF-bilaga (nödvändigt för HD och MÖD som saknar HTML-fulltext); extraherad text cachas lokalt. Tar `max_tecken` och `fran_tecken` för långa domar — ett kapat svar avslutas med en rad som anger hur mycket som visas och hur resten hämtas
 - **sok_rattpraxis_for_lagrum** — söker praxis kopplad till en specifik paragraf i en lag, t.ex. alla HD-domar om 36 § avtalslagen
 - **hamta_avgorande_pa_beteckning** — söker på NJA-nummer (NJA 2025:67), HFD-referat (HFD 2026 ref. 1), HD:s kortnamn eller målnummer
-- **sok_i_domtext** — söker fulltext inuti cachade domtexter; PostgreSQL ger avancerad FTS med relevansrankning och kontextutdrag, SQLite ger enklare LIKE-sökning
+- **sok_i_domtext** — söker fulltext i de avgöranden som finns i den lokala databasen: HTML-fulltext, sammanfattning och benämning, samt PDF-texter som hämtats med `hamta_pdf`. PostgreSQL ger fulltextsökning med relevansrankning och kontextutdrag, SQLite enklare delsträngssökning. Svaret visar i fältet `tackning` hur mycket av korpusen som finns lokalt
 
-### Arkitektur: cache på begäran
+Alla verktyg är läsande och bär MCP-annotationer. Förväntade fel — okänt id, ingen träff på en beteckning, källan svarar inte — returneras som verktygsfel (`isError`) med ett meddelande på svenska.
 
-Servern laddar inga avgöranden i förväg. Metadata och PDF-texter hämtas från Domstolsverkets API vid det första anropet och lagras sedan i databasen med konfigurerbar TTL. Sökning med `sok_i_domtext` täcker därför bara avgöranden som redan hämtats via `hamta_avgorande` eller `hamta_pdf` i tidigare sessioner.
+### Arkitektur: cache och daglig synk
+
+Metadata och PDF-texter hämtas från Domstolsverkets API vid det första anropet och lagras i databasen med konfigurerbar TTL. Synkskriptet `01_synka_publiceringar.py` fyller dessutom databasen med samtliga publiceringar, så att `sok_i_domtext` söker i hela korpusen och inte bara i det som råkat hämtas tidigare.
+
+`sok_i_domtext` blir heltäckande först efter en första fullsynk. Utan synk söker verktyget bara i de avgöranden som hämtats med `hamta_avgorande`, `hamta_avgorande_pa_beteckning` eller `hamta_pdf`, och svaret säger det. Domar och beslut från HD och MÖD som bara finns som PDF är sökbara på sammanfattningen tills PDF:en hämtats med `hamta_pdf`; synken hämtar inga PDF-filer.
 
 ### Korsreferenser i rättskedjan
 
@@ -29,7 +33,8 @@ Varje avgörande innehåller maskinläsbara hänvisningar som möjliggör navige
 ## Krav
 
 - Python 3.11 eller senare
-- PostgreSQL (för `sok_i_domtext` med fulltext-sökning) eller SQLite (med enklare LIKE-sökning)
+- MCP-biblioteket `mcp` version 2.x (`mcp>=2.0,<3`)
+- PostgreSQL (för `sok_i_domtext` med fulltext-sökning) eller SQLite (med enklare delsträngssökning)
 - Internetanslutning mot `https://rattspraxis.etjanst.domstol.se`
 
 ## Installation
@@ -37,9 +42,8 @@ Varje avgörande innehåller maskinläsbara hänvisningar som möjliggör navige
 ```bash
 git clone https://github.com/MagnusKolsjo/mcp-for-rattspraxis.git
 cd mcp-for-rattspraxis
-python3 -m venv .venv --without-pip
-.venv/bin/python3 -m ensurepip
-.venv/bin/python3 -m pip install mcp requests python-dotenv pymupdf4llm psycopg2-binary starlette uvicorn
+python3 -m venv .venv
+.venv/bin/python3 -m pip install -r requirements.txt
 cp config.example.env .env
 ```
 
@@ -57,12 +61,35 @@ Lägg till följande block i konfigurationsfilen för ditt AI-verktyg:
 }
 ```
 
+## HTTP-läge
+
+Med `MCP_TRANSPORT=http` körs servern som en långlivad process med Streamable HTTP på `http://<MCP_HOST>:<MCP_PORT>/mcp` (standard `127.0.0.1:8005`). Läget kräver `MCP_API_KEY`: utan nyckel avbryts uppstarten med exitkod 2. Klienten skickar nyckeln som `Authorization: Bearer <nyckel>`; ett anrop utan header ger 401 och ett med fel nyckel 403.
+
+## Daglig synk
+
+```bash
+# Första körningen: fullsynk av hela korpusen
+.venv/bin/python3 01_synka_publiceringar.py
+
+# Därefter dagligen via launchd (macOS) eller cron (Linux)
+.venv/bin/python3 01_synka_publiceringar.py --installera-schema
+```
+
+Skriptet hämtar `GET /publiceringar` sorterat på publiceringstid, 100 publiceringar per sida med två sekunders paus mellan sidorna (`RP_SYNK_PAUS_SEKUNDER`), och skriver varje sida till `avgorande_cache`. Läget sparas i `synk_status` efter varje sida: en avbruten körning fortsätter där den slutade, och de dagliga körningarna hämtar bara det som publicerats sedan förra gången. `--sedan ÅÅÅÅ-MM-DD` hämtar om från ett datum och `--alla` gör en ny fullsynk.
+
+`--installera-schema` lägger in `synk_daglig.sh` i launchd eller cron enligt `SCHEMALAGGARE` och `CRON_SCHEMA` (standard 04:15). Wrappern loggar till `logs/synk-ÅÅÅÅ-MM-DD.log` och rensar loggar äldre än `LOGGRADER_BEHALL_DAGAR`.
+
+**Storlek och tid för fullsynken.** Källan har drygt 17 000 publiceringar (17 366 i september 2026), vilket blir omkring 175 sidanrop och 300–400 MB att hämta. Med pausen mellan sidorna tar fullsynken ungefär 10–15 minuter. Databasen växer med i storleksordningen 0,5–1 GB i PostgreSQL, fulltextindexet inräknat. De dagliga körningarna hämtar en eller ett par sidor.
+
+Publiceringar som ändras hos källan utan att få en ny publiceringstid fångas inte av den inkrementella synken. De uppdateras när cachens TTL gått ut och avgörandet hämtas på nytt, eller vid en ny fullsynk med `--alla`. Efter en fullsynk jämför skriptet antalet lokala avgöranden med källans totalsiffra och loggar om några saknas.
+
 ## Databasschema
 
-Servern skapar automatiskt schemat `rattspraxis` i din PostgreSQL-databas (eller tabellerna direkt om SQLite används) vid första uppstarten:
+Servern skapar automatiskt schemat `rattspraxis` i din PostgreSQL-databas (eller tabellerna direkt om SQLite används) vid uppstart, och lägger till nya kolumner och tabeller i befintliga databaser:
 
-- `rattspraxis.avgorande_cache` — cachad metadata per avgörande (TTL-styrd)
+- `rattspraxis.avgorande_cache` — publiceringarna, med metadata, hela API-svaret och en sökbar text (`sokbar_text`, med GIN-index för svensk fulltext-sökning)
 - `rattspraxis.pdf_cache` — extraherad PDF-text med GIN-index för svensk fulltext-sökning
+- `rattspraxis.synk_status` — läget för synkskriptet
 
 ## Licens
 
