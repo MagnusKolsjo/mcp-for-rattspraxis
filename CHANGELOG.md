@@ -20,6 +20,12 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 - **Sökförfiningar i `sok_rattpraxis`.** Den nya valfria parametern `forfiningar`
   (standard `false`) ger fältet `forfiningar`: antal träffar per domstol, SFS-nummer,
   rättsområde, nyckelord, avgörandetyp och publiceringsform, via `POST /sokforfiningar`.
+- `max_tecken` och `fran_tecken` i `hamta_avgorande`. HTML-fulltexten (`innehall_html`)
+  kapas som standard vid 60 000 tecken, även i `hamta_avgorande_pa_beteckning`, eftersom
+  svaret nu skickas både som text och som strukturerat innehåll. En kapad text avslutas
+  med en rad som anger hur mycket som visas och hur resten läses, och de nya fälten
+  `innehall_tecken_totalt` och `innehall_trunkerad` visar läget. Kapningen sker aldrig
+  inne i en HTML-tagg.
 - Verktygen har titlar, MCP-annotationer (alla är läsande) och utdataschema; svaren
   skickas även som `structuredContent`. `hamta_pdf` returnerar domtexten som ren text.
 

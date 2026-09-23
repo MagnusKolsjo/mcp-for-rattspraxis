@@ -7,7 +7,7 @@ En MCP-server som ger AI-verktyg med stöd för MCP-protokollet tillgång till D
 Servern exponerar sex verktyg:
 
 - **sok_rattpraxis** — söker i hela rättspraxis-databasen med filter på domstol, datum, SFS-nummer, rättsområde och nyckelord. Med `forfiningar=true` redovisas också hur träffarna fördelar sig på domstolar, lagar, rättsområden, nyckelord, avgörandetyper och publiceringsformer, med antal per värde — underlag för att snäva in en bred sökning
-- **hamta_avgorande** — hämtar ett fullständigt avgörande med metadata, lagrum, förarbeteshänvisningar och EU-rättshänvisningar, och vid behov syskonpubliceringen (dom eller beslut ↔ referat)
+- **hamta_avgorande** — hämtar ett fullständigt avgörande med metadata, lagrum, förarbeteshänvisningar och EU-rättshänvisningar, och vid behov syskonpubliceringen (dom eller beslut ↔ referat). HTML-fulltexten kapas som standard vid 60 000 tecken; `max_tecken` och `fran_tecken` läser resten
 - **hamta_pdf** — hämtar och extraherar text ur PDF-bilaga (nödvändigt för HD och MÖD som saknar HTML-fulltext); extraherad text cachas lokalt. Tar `max_tecken` och `fran_tecken` för långa domar — ett kapat svar avslutas med en rad som anger hur mycket som visas och hur resten hämtas
 - **sok_rattpraxis_for_lagrum** — söker praxis kopplad till en specifik paragraf i en lag, t.ex. alla HD-domar om 36 § avtalslagen
 - **hamta_avgorande_pa_beteckning** — söker på NJA-nummer (NJA 2025:67), HFD-referat (HFD 2026 ref. 1), HD:s kortnamn eller målnummer

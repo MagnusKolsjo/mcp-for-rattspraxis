@@ -120,6 +120,7 @@ def _skar_ut_text(
     max_tecken: int,
     fran_tecken: int = 0,
     anvisning: Callable[[int], str] | None = None,
+    html: bool = False,
 ) -> str:
     """
     Skär ut ett textutdrag och markera alltid när något kapats.
@@ -136,6 +137,9 @@ def _skar_ut_text(
     utdraget kortare än max_tecken, och en fortsättning vid fran_tecken +
     max_tecken skulle hoppa över det avkapade ordet. Det sista utdraget får
     ingen läs vidare-rad.
+
+    Med html=True kapas texten aldrig inne i en tagg: hamnar gränsen efter
+    ett '<' utan avslutande '>' flyttas den till före taggen.
     """
     text   = text or ""
     totalt = len(text)
@@ -145,7 +149,10 @@ def _skar_ut_text(
     kapad = bool(max_tecken and max_tecken > 0 and len(rest) > max_tecken)
     if kapad:
         utdrag    = rest[:max_tecken]
-        brytpunkt = max(utdrag.rfind(" "), utdrag.rfind("\n"))
+        if html and utdrag.rfind("<") > utdrag.rfind(">"):
+            brytpunkt = utdrag.rfind("<")
+        else:
+            brytpunkt = max(utdrag.rfind(" "), utdrag.rfind("\n"))
         if brytpunkt > max_tecken * 0.6:
             utdrag = utdrag[:brytpunkt]
         # Ett utdrag som bara består av blanktecken skulle ge slut == start,
@@ -328,6 +335,8 @@ class Avgorande(TypedDict):
     har_html_fulltext: bool
     bilagor: list[Bilaga]
     innehall_html: NotRequired[str | None]
+    innehall_tecken_totalt: NotRequired[int]
+    innehall_trunkerad: NotRequired[bool]
     info: NotRequired[str]
 
 
@@ -406,8 +415,20 @@ class Domtextresultat(TypedDict):
 # Intern hjälpfunktion: formatering
 # ---------------------------------------------------------------------------
 
-def _formatera_avgorande(a: dict, inkludera_innehall: bool = False) -> dict:
-    """Formaterar ett avgörande-objekt till ett lämpligt MCP-svar."""
+def _formatera_avgorande(
+    a: dict,
+    inkludera_innehall: bool = False,
+    max_tecken: int = RP_MAX_TECKEN,
+    fran_tecken: int = 0,
+) -> dict:
+    """
+    Formaterar ett avgörande-objekt till ett lämpligt MCP-svar.
+
+    HTML-fulltexten kapas vid max_tecken, eftersom svaret skickas både som
+    text och som strukturerat innehåll och ett långt referat annars kan
+    närma sig protokollets storleksgräns. Ett kapat utdrag avslutas med en
+    rad om hur resten läses med hamta_avgorande.
+    """
     har_innehall = bool(a.get("innehall"))
     bilagor = a.get("bilagaLista") or []
     domstol = a.get("domstol") or {}
@@ -441,7 +462,23 @@ def _formatera_avgorande(a: dict, inkludera_innehall: bool = False) -> dict:
     }
 
     if inkludera_innehall and har_innehall:
-        result["innehall_html"] = a.get("innehall")
+        innehall = a.get("innehall") or ""
+        avgorande_id = a.get("id")
+
+        def _anvisning(slut: int) -> str:
+            return (
+                f'Läs vidare: hamta_avgorande(avgorande_id="{avgorande_id}", '
+                f"max_tecken={max_tecken}, fran_tecken={slut})"
+            )
+
+        result["innehall_html"] = _skar_ut_text(
+            innehall, max_tecken, fran_tecken, _anvisning, html=True,
+        )
+        result["innehall_tecken_totalt"] = len(innehall)
+        result["innehall_trunkerad"] = bool(
+            max_tecken and max_tecken > 0
+            and len(innehall) - max(0, fran_tecken) > max_tecken
+        )
     elif not har_innehall and bilagor:
         result["info"] = (
             "Fulltext saknas i API:et för denna domstol. "
@@ -650,6 +687,19 @@ def hamta_avgorande(
             "om tillgänglig (standard: false)"
         ),
     )] = False,
+    max_tecken: Annotated[int, Field(
+        description=(
+            "Teckentak för HTML-fulltexten (standard 60 000, 0 = hela texten). "
+            "En kapad text avslutas med en rad som anger hur mycket som visas "
+            "och hur resten hämtas; innehall_trunkerad är då true."
+        ),
+    )] = RP_MAX_TECKEN,
+    fran_tecken: Annotated[int, Field(
+        description=(
+            "Börja HTML-fulltexten vid denna teckenposition — för att läsa "
+            "vidare där ett kapat svar slutade. Citera aldrig ur ett kapat utdrag."
+        ),
+    )] = 0,
 ) -> AvgorandeMedKompanjon:
     """
     Hämtar ett fullständigt avgörande med all metadata: lagrum,
@@ -666,7 +716,10 @@ def hamta_avgorande(
         kalla = "api"
 
     log.info("hamta_avgorande %s — källa: %s", avgorande_id, kalla)
-    result = _formatera_avgorande(a, inkludera_innehall=bool(inkludera_html))
+    result = _formatera_avgorande(
+        a, inkludera_innehall=bool(inkludera_html),
+        max_tecken=max_tecken, fran_tecken=fran_tecken,
+    )
 
     if hamta_kompanjon:
         kompanjon = _hamta_grupp_kompanjon(a)
