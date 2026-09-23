@@ -208,6 +208,22 @@ def _hamta_publicering_api(avgorande_id: str) -> dict:
     return r.json()
 
 
+def _satt_datumintervall(filter_: dict, datum_fran: str | None, datum_till: str | None) -> None:
+    """
+    Lägger in avgörandedatumets intervall i sökfiltret.
+
+    API:et läser datumgränserna ur filter.intervall. Lagda direkt i filter
+    ignoreras de utan felmeddelande, och sökningen blir då ofiltrerad.
+    """
+    intervall = {}
+    if datum_fran:
+        intervall["fromDatum"] = datum_fran
+    if datum_till:
+        intervall["toDatum"] = datum_till
+    if intervall:
+        filter_["intervall"] = intervall
+
+
 # ---------------------------------------------------------------------------
 # Intern hjälpfunktion: grupp-kompanjon (DOM_ELLER_BESLUT ↔ REFERAT)
 # ---------------------------------------------------------------------------
@@ -605,10 +621,7 @@ async def _sok_rattpraxis(
         f["rattsomradeLista"] = [rattsomrade]
     if sfs_nummer:
         f["sfsNummerLista"] = [sfs_nummer]
-    if datum_fran:
-        f["fromDatum"] = datum_fran
-    if datum_till:
-        f["toDatum"] = datum_till
+    _satt_datumintervall(f, datum_fran, datum_till)
     if nyckelord:
         f["sokordLista"] = [nyckelord]
 
@@ -772,10 +785,7 @@ async def _sok_rattpraxis_for_lagrum(
     f = body["filter"]
     if ar_vagledande is not None:
         f["arVagledande"] = ar_vagledande
-    if datum_fran:
-        f["fromDatum"] = datum_fran
-    if datum_till:
-        f["toDatum"] = datum_till
+    _satt_datumintervall(f, datum_fran, datum_till)
 
     # Notera: sok_rattpraxis_for_lagrum filtrerar inte på domstol via API —
     # domstolsfiltrering kan läggas till som parameter i framtida version om behov uppstår
