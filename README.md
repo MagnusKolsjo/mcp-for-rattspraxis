@@ -11,7 +11,7 @@ Servern exponerar sex verktyg:
 - **hamta_pdf** — hämtar och extraherar text ur PDF-bilaga (nödvändigt för HD och MÖD som saknar HTML-fulltext); extraherad text cachas lokalt. Tar `max_tecken` och `fran_tecken` för långa domar — ett kapat svar avslutas med en rad som anger hur mycket som visas och hur resten hämtas
 - **sok_rattpraxis_for_lagrum** — söker praxis kopplad till en specifik paragraf i en lag, t.ex. alla HD-domar om 36 § avtalslagen
 - **hamta_avgorande_pa_beteckning** — söker på NJA-nummer (NJA 2025:67), HFD-referat (HFD 2026 ref. 1), HD:s kortnamn eller målnummer
-- **sok_i_domtext** — söker fulltext i de avgöranden som finns i den lokala databasen: HTML-fulltext, sammanfattning och benämning, samt PDF-texter som hämtats med `hamta_pdf`. PostgreSQL ger fulltextsökning med relevansrankning och kontextutdrag, SQLite enklare delsträngssökning. Svaret visar i fältet `tackning` hur mycket av korpusen som finns lokalt
+- **sok_i_domtext** — söker fulltext i de avgöranden som finns i den lokala databasen: HTML-fulltext, sammanfattning och benämning, samt PDF-texter som hämtats med `hamta_pdf`. PostgreSQL ger fulltextsökning med relevansrankning och kontextutdrag, SQLite enklare delsträngssökning. Svaret visar i fältet `tackning` hur mycket av korpusen som finns lokalt och när den senaste lyckade synken gjordes; `heltackande` är sant bara efter en fullsynk och när den senaste lyckade synken är högst `RP_TACKNING_MAX_DAGAR` (standard 3) dagar gammal
 
 Alla verktyg är läsande och bär MCP-annotationer. Förväntade fel — okänt id, ingen träff på en beteckning, källan svarar inte — returneras som verktygsfel (`isError`) med ett meddelande på svenska.
 

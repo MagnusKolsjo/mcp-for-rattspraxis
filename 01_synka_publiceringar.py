@@ -128,7 +128,7 @@ def synka(sedan: str | None = None, alla: bool = False, max_sidor: int | None = 
     log.info("Synkar publiceringar %s",
              "från början (fullsynk)" if fullsynk else f"publicerade från och med {fran}")
     db.spara_synk_status(
-        JOBB, status="pagar", startad=_nu(), avslutad=None, fran_datum=fran,
+        JOBB, status="pagar", startad=_nu(), fran_datum=fran,
         antal_sidor=0, antal_publiceringar=0, meddelande=None,
     )
 
@@ -155,14 +155,21 @@ def synka(sedan: str | None = None, alla: bool = False, max_sidor: int | None = 
                 break
             time.sleep(PAUS_SEKUNDER)
     except Exception as e:
-        db.spara_synk_status(JOBB, status="fel", avslutad=_nu(), meddelande=str(e)[:500])
+        # avslutad lämnas orörd: den anger när den senaste lyckade körningen
+        # blev klar, och sok_i_domtext bedömer täckningen utifrån den.
+        db.spara_synk_status(
+            JOBB, status="fel", meddelande=f"{_nu()}: {e}"[:500],
+        )
         log.error("Synken avbröts efter %d sidor: %s", sida, e)
         raise
 
     avslutad_i_fortid = max_sidor is not None and sida >= max_sidor
-    klar = {"status": "avbruten" if avslutad_i_fortid else "klar", "avslutad": _nu()}
-    if fullsynk and not avslutad_i_fortid:
-        klar["fullsynk_klar"] = klar["avslutad"]
+    if avslutad_i_fortid:
+        klar = {"status": "avbruten"}
+    else:
+        klar = {"status": "klar", "avslutad": _nu()}
+        if fullsynk:
+            klar["fullsynk_klar"] = klar["avslutad"]
     db.spara_synk_status(JOBB, **klar)
     log.info("Klart — %d publiceringar på %d sidor, senast publicerad %s",
              antal, sida, senaste)

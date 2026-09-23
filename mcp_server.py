@@ -17,6 +17,7 @@ import contextlib
 import logging
 import os
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any, Callable
 
@@ -66,6 +67,12 @@ log = logging.getLogger(__name__)
 # långt avgörande överskrida MCP-protokollets storleksgräns och misslyckas helt.
 # Anroparen kan alltid höja taket, eller sätta 0 för hela texten.
 RP_MAX_TECKEN = int(os.getenv("RP_MAX_TECKEN", "60000"))
+
+# sok_i_domtext räknas som heltäckande bara om en fullsynk gjorts och den
+# senaste lyckade synken är högst så här många dagar gammal. Källan publicerar
+# nya avgöranden varje vardag; en synk som slutat gå ger annars ett
+# heltäckande-besked som tyst blir alltmer fel.
+RP_TACKNING_MAX_DAGAR = int(os.getenv("RP_TACKNING_MAX_DAGAR", "3"))
 
 # Maximalt antal träffar per API-sida — API:et tillåter upp till 50.
 # Värdet är ett designval: 50 balanserar svarstid mot täckning vid paginering.
@@ -400,6 +407,7 @@ class Tackning(TypedDict):
     pdf_texter_lokalt: int
     heltackande: bool
     senaste_synk: str | None
+    synkstatus: str | None
     fullsynk_klar: str | None
 
 
@@ -1024,11 +1032,22 @@ def _tackning() -> dict | None:
     except Exception as e:
         log.warning("Täckningen kunde inte läsas: %s", e)
         return None
+    senaste = lage.get("avslutad")
+    aktuell = False
+    if senaste:
+        try:
+            tid = datetime.fromisoformat(str(senaste))
+            if tid.tzinfo is None:
+                tid = tid.replace(tzinfo=timezone.utc)
+            aktuell = datetime.now(timezone.utc) - tid <= timedelta(days=RP_TACKNING_MAX_DAGAR)
+        except ValueError:
+            log.warning("Oläsligt synkdatum i synk_status: %r", senaste)
     return {
         "avgoranden_lokalt": antal["avgoranden"],
         "pdf_texter_lokalt": antal["pdf_texter"],
-        "heltackande": bool(lage.get("fullsynk_klar")),
-        "senaste_synk": lage.get("avslutad") if lage.get("status") == "klar" else None,
+        "heltackande": bool(lage.get("fullsynk_klar")) and aktuell,
+        "senaste_synk": senaste,
+        "synkstatus": lage.get("status"),
         "fullsynk_klar": lage.get("fullsynk_klar"),
     }
 
@@ -1213,11 +1232,22 @@ def sok_i_domtext(
     if tackning is not None:
         resultat["tackning"] = tackning
         if not tackning["heltackande"]:
+            if tackning["fullsynk_klar"]:
+                orsak = (
+                    f"Senaste lyckade synk var {tackning['senaste_synk']}, mer än "
+                    f"{RP_TACKNING_MAX_DAGAR} dagar sedan; senare publiceringar "
+                    "saknas lokalt. Kontrollera att den dagliga synken körs "
+                    "(logs/synk-*.log)."
+                )
+            else:
+                orsak = (
+                    "Ingen fullsynk har gjorts. Kör 01_synka_publiceringar.py för "
+                    "att lagra alla publiceringar lokalt."
+                )
             resultat["info"] = (
-                f"Sökningen omfattar bara de {tackning['avgoranden_lokalt']} avgöranden "
-                "och de PDF-texter som finns lokalt, inte hela Domstolsverkets "
-                "korpus. Kör 01_synka_publiceringar.py för att lagra alla "
-                "publiceringar lokalt."
+                f"Sökningen omfattar de {tackning['avgoranden_lokalt']} avgöranden "
+                "och de PDF-texter som finns lokalt, inte med säkerhet hela "
+                f"Domstolsverkets korpus. {orsak}"
             )
     return resultat
 

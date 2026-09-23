@@ -16,7 +16,10 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 - **`sok_i_domtext` söker i hela korpusen** efter en fullsynk: benämning, referatnummer,
   sammanfattning, nyckelord och HTML-fulltext för varje lokalt lagrat avgörande, utöver
   PDF-texterna. Varje träff har fältet `kalla` (`avgorande` eller `pdf`), och svaret
-  har fältet `tackning` som visar hur mycket av korpusen som finns lokalt.
+  har fältet `tackning` som visar hur mycket av korpusen som finns lokalt. Sökningen
+  räknas som heltäckande bara efter en fullsynk och om den senaste lyckade synken är
+  högst `RP_TACKNING_MAX_DAGAR` (standard 3) dagar gammal; `tackning` visar datumet
+  för den senaste lyckade synken och synkens status.
 - **Sökförfiningar i `sok_rattpraxis`.** Den nya valfria parametern `forfiningar`
   (standard `false`) ger fältet `forfiningar`: antal träffar per domstol, SFS-nummer,
   rättsområde, nyckelord, avgörandetyp och publiceringsform, via `POST /sokforfiningar`.
