@@ -19,7 +19,7 @@ Alla verktyg är läsande och bär MCP-annotationer. Förväntade fel — okänt
 
 Metadata och PDF-texter hämtas från Domstolsverkets API vid det första anropet och lagras i databasen med konfigurerbar TTL. Synkskriptet `01_synka_publiceringar.py` fyller dessutom databasen med samtliga publiceringar, så att `sok_i_domtext` söker i hela korpusen och inte bara i det som råkat hämtas tidigare.
 
-`sok_i_domtext` blir heltäckande först efter en första fullsynk. Utan synk söker verktyget bara i de avgöranden som hämtats med `hamta_avgorande`, `hamta_avgorande_pa_beteckning` eller `hamta_pdf`, och svaret säger det. Domar och beslut från HD och MÖD som bara finns som PDF är sökbara på sammanfattningen tills PDF:en hämtats med `hamta_pdf`; synken hämtar inga PDF-filer.
+`sok_i_domtext` blir heltäckande först efter en första fullsynk. Utan synk söker verktyget bara i de avgöranden som hämtats med `hamta_avgorande`, `hamta_avgorande_pa_beteckning` eller `hamta_pdf`, och svaret säger det. Domar och beslut som bara finns som PDF (från HD, MÖD, Patent- och marknadsöverdomstolen m.fl.) är sökbara på sammanfattningen tills PDF-texten lagrats, antingen med `hamta_pdf` eller med synkens PDF-steg (`--med-pdf`). `tackning` visar hur stor andel av dem som har sin text lagrad.
 
 ### Korsreferenser i rättskedjan
 
@@ -68,8 +68,8 @@ Med `MCP_TRANSPORT=http` körs servern som en långlivad process med Streamable 
 ## Daglig synk
 
 ```bash
-# Första körningen: fullsynk av hela korpusen
-.venv/bin/python3 01_synka_publiceringar.py
+# Första körningen: fullsynk av hela korpusen, och PDF-texterna
+.venv/bin/python3 01_synka_publiceringar.py --med-pdf
 
 # Därefter dagligen via launchd (macOS) eller cron (Linux)
 .venv/bin/python3 01_synka_publiceringar.py --installera-schema
@@ -77,9 +77,13 @@ Med `MCP_TRANSPORT=http` körs servern som en långlivad process med Streamable 
 
 Skriptet hämtar `GET /publiceringar` sorterat på publiceringstid, 100 publiceringar per sida med två sekunders paus mellan sidorna (`RP_SYNK_PAUS_SEKUNDER`), och skriver varje sida till `avgorande_cache`. Läget sparas i `synk_status` efter varje sida: en avbruten körning fortsätter där den slutade, och de dagliga körningarna hämtar bara det som publicerats sedan förra gången. `--sedan ÅÅÅÅ-MM-DD` hämtar om från ett datum och `--alla` gör en ny fullsynk.
 
-`--installera-schema` lägger in `synk_daglig.sh` i launchd eller cron enligt `SCHEMALAGGARE` och `CRON_SCHEMA` (standard 04:15). Wrappern loggar till `logs/synk-ÅÅÅÅ-MM-DD.log` och rensar loggar äldre än `LOGGRADER_BEHALL_DAGAR`.
+Med `--med-pdf` följer ett andra steg (`--bara-pdf` kör bara det): PDF-bilagorna till lagrade publiceringar som saknar HTML-fulltext och ännu inte har text i `pdf_cache` hämtas, nyaste först, med två sekunders paus mellan filerna (`RP_SYNK_PDF_PAUS_SEKUNDER`). Texten extraheras som i `hamta_pdf` och lagras i `pdf_cache`, där `sok_i_domtext` söker. Varje text lagras för sig, så ett avbrutet steg fortsätter med de PDF:er som återstår. En PDF som saknas hos källan eller inte går att läsa hoppas över och försöks igen nästa gång.
+
+`--installera-schema` lägger in `synk_daglig.sh`, som kör båda stegen, i launchd eller cron enligt `SCHEMALAGGARE` och `CRON_SCHEMA` (standard 04:15). Wrappern loggar till `logs/synk-ÅÅÅÅ-MM-DD.log` och rensar loggar äldre än `LOGGRADER_BEHALL_DAGAR`.
 
 **Storlek och tid för fullsynken.** Källan har drygt 17 000 publiceringar (17 366 i september 2026), vilket blir omkring 175 sidanrop och 300–400 MB att hämta. Med pausen mellan sidorna tar fullsynken ungefär 10–15 minuter. Databasen växer med i storleksordningen 0,5–1 GB i PostgreSQL, fulltextindexet inräknat. De dagliga körningarna hämtar en eller ett par sidor.
+
+**Storlek och tid för PDF-steget.** Omkring 750 publiceringar är domar eller beslut (publiceringsform `DOM_ELLER_BESLUT`, september 2026), och alla utom HFD:s saknar HTML-fulltext — alltså runt 700 PDF:er, de flesta från Mark- och miljööverdomstolen. I ett litet urval var filerna 0,2–2,3 MB och tog 1–7 sekunder att hämta och extrahera. Första körningen blir därmed ungefär 0,3–0,6 GB att hämta och tar omkring en timme; den lagrade texten är några tiotal MB. Därefter tillkommer några PDF:er per dag.
 
 Publiceringar som ändras hos källan utan att få en ny publiceringstid fångas inte av den inkrementella synken. De uppdateras när cachens TTL gått ut och avgörandet hämtas på nytt, eller vid en ny fullsynk med `--alla`. Efter en fullsynk jämför skriptet antalet lokala avgöranden med källans totalsiffra och loggar om några saknas.
 

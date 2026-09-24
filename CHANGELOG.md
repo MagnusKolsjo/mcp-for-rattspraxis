@@ -15,6 +15,13 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
   kör synken med loggning, och `--installera-schema` lägger in den i launchd eller cron.
   Wrappern läser inte in `.env` med `source`, så värden med `&`, `$` eller citattecken
   (t.ex. i `DATABASE_URL`) går bra; sökvägar med blanksteg citeras i cron-raden.
+- **PDF-texterna i synken.** Med `--med-pdf` (eller `--bara-pdf`) hämtar
+  `01_synka_publiceringar.py` även PDF-bilagorna till publiceringar som saknar
+  HTML-fulltext — domar och beslut från bland andra HD och MÖD, omkring 700 filer — och
+  lagrar texten i `pdf_cache`, så att de blir sökbara i fulltext med `sok_i_domtext`.
+  Steget är återupptagbart, pausar två sekunder mellan filerna och körs av
+  `synk_daglig.sh`. `tackning` i `sok_i_domtext` visar hur stor andel av
+  PDF-publiceringarna som har sin text lagrad.
 - **`sok_i_domtext` söker i hela korpusen** efter en fullsynk: benämning, referatnummer,
   sammanfattning, nyckelord och HTML-fulltext för varje lokalt lagrat avgörande, utöver
   PDF-texterna. Varje träff har fältet `kalla` (`avgorande` eller `pdf`), och svaret
@@ -48,7 +55,8 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
   i stället för en sökning på benämningen. Avgöranden utan benämning, som de flesta från
   HFD, får nu också sin kompanjon.
 - `sok_i_domtext` med SQLite returnerar samma fält som med PostgreSQL (utom `relevans`).
-- Anropen mot källan är samlade i `klient.py`.
+- Anropen mot källan är samlade i `klient.py` och PDF-extraktionen i `pdftext.py`,
+  så att servern och synken använder samma kod.
 - PDF-extraktionen körs under ett lås, eftersom verktygen körs på arbetstrådar och
   PyMuPDF inte är trådsäkert.
 - Databasschemat: kolumnen `sokbar_text` (med GIN-index i PostgreSQL) i
