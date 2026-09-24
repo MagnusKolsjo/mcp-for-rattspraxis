@@ -16,7 +16,6 @@ Konfiguration via .env-fil — se config.example.env.
 import contextlib
 import logging
 import os
-import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any, Callable
@@ -35,6 +34,7 @@ from typing_extensions import NotRequired, TypedDict  # noqa: E402
 
 import db  # noqa: E402
 import klient  # noqa: E402
+import pdftext  # noqa: E402
 from db import (  # noqa: E402
     DATABASE_URL as _DATABASE_URL,
     _ar_postgres,
@@ -176,45 +176,6 @@ def _skar_ut_text(
     if kapad and anvisning is not None:
         noter.append(anvisning(slut))
     return utdrag + "\n\n[" + ". ".join(noter) + "]"
-
-
-# ---------------------------------------------------------------------------
-# PDF-extraktion
-# ---------------------------------------------------------------------------
-#
-# PyMuPDF är inte trådsäkert, och verktygen körs på arbetstrådar. Låset
-# serialiserar extraktionen. Det skyddar också _tysta_fd1, som flyttar
-# processens gemensamma filhandtag: två samtidiga omdirigeringar skulle
-# återställa handtagen i fel ordning.
-
-_pdf_las = threading.Lock()
-
-
-@contextlib.contextmanager
-def _tysta_fd1():
-    """
-    Redirigerar FD 1 och FD 2 till loggfil under anrop som skriver direkt
-    till filhandtagen (pymupdf4llm och dess C-bindningar).
-
-    MCP-protokollet skyddas redan av SDK:ns stdio-transport, som läser och
-    skriver på egna kopior av handtagen. Omdirigeringen håller i stället
-    extraktionens utskrifter borta från stderr, som klienten loggar.
-    Anropas bara med _pdf_las taget.
-    """
-    logg = _LOGS_DIR / "subprocess.log"
-    spara_ut = os.dup(1)
-    spara_fel = os.dup(2)
-    fd = os.open(str(logg), os.O_WRONLY | os.O_APPEND | os.O_CREAT)
-    try:
-        os.dup2(fd, 1)
-        os.dup2(fd, 2)
-        yield
-    finally:
-        os.dup2(spara_ut, 1)
-        os.dup2(spara_fel, 2)
-        os.close(spara_ut)
-        os.close(spara_fel)
-        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -810,35 +771,16 @@ def hamta_pdf(
         _sakerstall_avgorande_cache(avgorande_id)
         return _skar_ut_text(cachad_text, max_tecken, fran_tecken, _anvisning)
 
-    # pymupdf4llm importeras först här — det krävs bara när en PDF hämtas.
-    try:
-        import fitz
-        import pymupdf4llm
-    except ImportError as e:
-        raise ToolError(
-            "pymupdf4llm är inte installerat. Kör: pip install pymupdf4llm "
-            "och starta om MCP-servern."
-        ) from e
-
     log.info("Hämtar PDF: %s", fillagring_id)
     with _kalla_som_toolerror():
         pdf_bytes = klient.hamta_bilaga(fillagring_id)
 
     try:
-        with _pdf_las:
-            dok = fitz.open(stream=pdf_bytes, filetype="pdf")
-            try:
-                with _tysta_fd1():
-                    markdown_text = pymupdf4llm.to_markdown(dok)
-            finally:
-                dok.close()
-        log.info("PDF extraherad: %d tecken, %d bytes", len(markdown_text), len(pdf_bytes))
-    except Exception as e:
+        markdown_text = pdftext.extrahera_text(pdf_bytes)
+    except pdftext.PdfFel as e:
         log.error("Fel vid PDF-extraktion av %s: %s", fillagring_id, e)
-        raise ToolError(
-            f"Texten i PDF:en '{fillagring_id}' kunde inte extraheras ({e}). "
-            "Filen kan vara skadad eller bara innehålla inskannade bilder."
-        ) from e
+        raise ToolError(f"PDF:en '{fillagring_id}': {e}") from e
+    log.info("PDF extraherad: %d tecken, %d bytes", len(markdown_text), len(pdf_bytes))
 
     _skriv_pdf_cache(
         fillagring_id=fillagring_id,
