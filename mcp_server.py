@@ -370,6 +370,9 @@ class Tackning(TypedDict):
     senaste_synk: str | None
     synkstatus: str | None
     fullsynk_klar: str | None
+    pdf_publiceringar: int
+    pdf_publiceringar_med_text: int
+    pdf_andel_med_text: float | None
 
 
 class Domtextresultat(TypedDict):
@@ -970,6 +973,7 @@ def _tackning() -> dict | None:
     """Hur mycket av korpusen som finns lokalt. None om det inte går att läsa."""
     try:
         antal = db.rakna_lokalt()
+        pdf = db.rakna_pdf_tackning()
         lage = db.las_synk_status("publiceringar") or {}
     except Exception as e:
         log.warning("Täckningen kunde inte läsas: %s", e)
@@ -991,6 +995,14 @@ def _tackning() -> dict | None:
         "senaste_synk": senaste,
         "synkstatus": lage.get("status"),
         "fullsynk_klar": lage.get("fullsynk_klar"),
+        # Publiceringar som bara finns som PDF är sökbara i fulltext först när
+        # PDF-texten lagrats, via hamta_pdf eller synkens PDF-steg.
+        "pdf_publiceringar": pdf["pdf_publiceringar"],
+        "pdf_publiceringar_med_text": pdf["pdf_publiceringar_med_text"],
+        "pdf_andel_med_text": (
+            round(pdf["pdf_publiceringar_med_text"] / pdf["pdf_publiceringar"], 3)
+            if pdf["pdf_publiceringar"] else None
+        ),
     }
 
 
@@ -1110,11 +1122,12 @@ def sok_i_domtext(
     """
     Söker fulltext inuti domstolsavgöranden i den lokala databasen: HTML-
     fulltexten, sammanfattningen och benämningen för varje lokalt lagrat
-    avgörande, samt PDF-texter som hämtats med hamta_pdf. När servern synkas
-    dagligen omfattar databasen hela Domstolsverkets korpus; annars bara de
-    avgöranden som hämtats tidigare. Fältet tackning visar vilket. Domar och
-    beslut från HD och MÖD som bara finns som PDF är sökbara på
-    sammanfattningen tills PDF:en hämtats. Använd för att hitta specifika
+    avgörande, samt PDF-texter som hämtats med hamta_pdf eller synken. När
+    servern synkas dagligen omfattar databasen hela Domstolsverkets korpus;
+    annars bara de avgöranden som hämtats tidigare. Fältet tackning visar
+    vilket, och hur stor del av publiceringarna som bara finns som PDF (domar
+    och beslut från HD, MÖD m.fl.) som har sin text lagrad; övriga är sökbara
+    på sammanfattningen. Använd för att hitta specifika
     resonemang, lagcitat eller rättsliga principer i domtexterna — kompletterar
     metadata-sökning med sökning i domskälen. Varje träff anger kalla
     ('avgorande' eller 'pdf'). PostgreSQL: avancerad FTS med träffrelevans och
@@ -1198,6 +1211,16 @@ def sok_i_domtext(
                 "och de PDF-texter som finns lokalt, inte med säkerhet hela "
                 f"Domstolsverkets korpus. {orsak}"
             )
+    if tackning is not None:
+        saknas = tackning["pdf_publiceringar"] - tackning["pdf_publiceringar_med_text"]
+        if saknas > 0:
+            pdf_rad = (
+                f"{saknas} av {tackning['pdf_publiceringar']} publiceringar som bara "
+                "finns som PDF (domar och beslut från bl.a. HD och MÖD) är sökbara "
+                "bara på sammanfattningen; deras fulltext hämtas med hamta_pdf "
+                "eller synkens PDF-steg (--med-pdf)."
+            )
+            resultat["info"] = f"{resultat['info']} {pdf_rad}" if "info" in resultat else pdf_rad
     return resultat
 
 
