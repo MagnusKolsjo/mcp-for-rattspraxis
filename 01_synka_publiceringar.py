@@ -14,6 +14,12 @@ tabellen synk_status efter varje sida:
     inte.
   - En avbruten körning fortsätter vid nästa körning där den slutade.
 
+Med --med-pdf (eller --bara-pdf) följer ett andra steg: PDF-bilagorna till
+publiceringar som saknar HTML-fulltext (domar och beslut från bland andra HD
+och MÖD) hämtas, texten extraheras och lagras i pdf_cache, där sok_i_domtext
+söker. Varje PDF lagras för sig, så steget kan avbrytas och fortsätter med
+de PDF:er som återstår.
+
 Publiceringar som ändras hos källan utan att få ny publiceringstid fångas
 inte av den inkrementella synken. De uppdateras när hamta_avgorande hämtar
 dem på nytt efter cachens TTL, eller vid en ny fullsynk (--alla).
@@ -22,6 +28,8 @@ Användning:
     python3 01_synka_publiceringar.py                    # inkrementellt
     python3 01_synka_publiceringar.py --sedan 2026-09-01 # från ett datum
     python3 01_synka_publiceringar.py --alla             # fullsynk
+    python3 01_synka_publiceringar.py --med-pdf          # även PDF-texterna
+    python3 01_synka_publiceringar.py --bara-pdf         # bara PDF-steget
     python3 01_synka_publiceringar.py --installera-schema
 
 Konfiguration via .env — se config.example.env.
@@ -45,6 +53,7 @@ load_dotenv(_SCRIPT_DIR / ".env")
 
 import db  # noqa: E402
 import klient  # noqa: E402
+import pdftext  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,10 +63,14 @@ logging.basicConfig(
 log = logging.getLogger("synk")
 
 JOBB = "publiceringar"
+JOBB_PDF = "pdf"
 
 # Paus mellan sidanropen. Varje sida är 1–2 MB; två sekunder håller
 # belastningen på källan låg även under en fullsynk.
 PAUS_SEKUNDER = float(os.getenv("RP_SYNK_PAUS_SEKUNDER", "2"))
+
+# Paus mellan PDF-hämtningarna. En PDF är typiskt några hundra kB.
+PDF_PAUS_SEKUNDER = float(os.getenv("RP_SYNK_PDF_PAUS_SEKUNDER", "2"))
 
 # Väntetider före nya försök när källan svarar med fel eller inte alls.
 _OMFORSOK_SEKUNDER = (10, 30, 90)
@@ -180,6 +193,89 @@ def synka(sedan: str | None = None, alla: bool = False, max_sidor: int | None = 
     return antal
 
 
+def _hamta_bilaga(fillagring_id: str) -> bytes:
+    """Hämtar en PDF, med nya försök vid tillfälliga fel hos källan."""
+    for forsok, vanta in enumerate((*_OMFORSOK_SEKUNDER, None), start=1):
+        try:
+            return klient.hamta_bilaga(fillagring_id)
+        except klient.AvgorandeSaknas:
+            raise
+        except klient.KallaFel as e:
+            if vanta is None:
+                raise
+            log.warning("PDF %s, försök %d misslyckades: %s Väntar %d s.",
+                        fillagring_id, forsok, e, vanta)
+            time.sleep(vanta)
+    return b""
+
+
+def synka_pdf(max_antal: int | None = None) -> int:
+    """
+    Hämtar och lagrar texten i PDF-bilagor som ännu saknar text.
+
+    En PDF som saknas hos källan eller inte går att läsa hoppas över och
+    loggas; den försöks igen vid nästa körning. Svarar källan inte alls
+    avbryts steget, så att nästa körning tar vid. Datumet för senaste
+    lyckade körning sparas bara när steget gått igenom hela listan.
+    Returnerar antal lagrade texter.
+    """
+    db._sakerstall_schema()
+    att_hamta = db.pdf_att_hamta(max_antal)
+    log.info("PDF-steget: %d bilagor saknar text", len(att_hamta))
+    # I synk_status för PDF-steget anger antal_publiceringar antal lagrade
+    # PDF-texter i den senaste körningen.
+    db.spara_synk_status(
+        JOBB_PDF, status="pagar", startad=_nu(),
+        antal_sidor=0, antal_publiceringar=0, meddelande=None,
+    )
+
+    lagrade = 0
+    hoppade: list[str] = []
+    byte_totalt = 0
+    try:
+        for nr, bilaga in enumerate(att_hamta, start=1):
+            fid = bilaga["fillagring_id"]
+            try:
+                pdf_bytes = _hamta_bilaga(fid)
+                text = pdftext.extrahera_text(pdf_bytes)
+            except (klient.AvgorandeSaknas, pdftext.PdfFel) as e:
+                log.warning("Hoppar över %s: %s", fid, e)
+                hoppade.append(fid)
+                continue
+            db._skriv_pdf_cache(
+                fillagring_id=fid, text_md=text,
+                avgorande_id=bilaga["avgorande_id"],
+                filstorlek=len(pdf_bytes), filnamn=bilaga["filnamn"], kasta=True,
+            )
+            lagrade += 1
+            byte_totalt += len(pdf_bytes)
+            if nr % 25 == 0:
+                log.info("%d av %d PDF:er, %d lagrade, %.1f MB",
+                         nr, len(att_hamta), lagrade, byte_totalt / 1e6)
+                db.spara_synk_status(JOBB_PDF, antal_publiceringar=lagrade)
+            if nr < len(att_hamta):
+                time.sleep(PDF_PAUS_SEKUNDER)
+    except Exception as e:
+        db.spara_synk_status(
+            JOBB_PDF, status="fel", antal_publiceringar=lagrade,
+            meddelande=f"{_nu()}: {e}"[:500],
+        )
+        log.error("PDF-steget avbröts efter %d lagrade texter: %s", lagrade, e)
+        raise
+
+    klar: dict = {"antal_publiceringar": lagrade}
+    if max_antal is not None and len(att_hamta) >= max_antal:
+        klar["status"] = "avbruten"
+    else:
+        klar.update(status="klar", avslutad=_nu())
+    if hoppade:
+        klar["meddelande"] = f"{len(hoppade)} PDF:er hoppades över, t.ex. {hoppade[0]}"
+    db.spara_synk_status(JOBB_PDF, **klar)
+    log.info("PDF-steget klart — %d texter lagrade (%.1f MB PDF), %d överhoppade",
+             lagrade, byte_totalt / 1e6, len(hoppade))
+    return lagrade
+
+
 # ---------------------------------------------------------------------------
 # Schemaläggning
 # ---------------------------------------------------------------------------
@@ -259,6 +355,12 @@ def main() -> None:
                         help="Fullsynk: hämta hela korpusen oavsett sparat läge.")
     parser.add_argument("--max-sidor", type=int,
                         help="Avbryt efter så många sidor (för test).")
+    parser.add_argument("--med-pdf", action="store_true",
+                        help="Hämta även PDF-texterna för publiceringar utan HTML-fulltext.")
+    parser.add_argument("--bara-pdf", action="store_true",
+                        help="Kör bara PDF-steget, inte synken av publiceringar.")
+    parser.add_argument("--max-pdf", type=int,
+                        help="Hämta högst så många PDF:er i PDF-steget (för test).")
     parser.add_argument("--installera-schema", action="store_true",
                         help="Installera daglig körning via launchd eller cron.")
     args = parser.parse_args()
@@ -276,7 +378,10 @@ def main() -> None:
         log.error("DATABASE_URL saknas i .env — synken behöver en databas.")
         sys.exit(1)
 
-    synka(sedan=args.sedan, alla=args.alla, max_sidor=args.max_sidor)
+    if not args.bara_pdf:
+        synka(sedan=args.sedan, alla=args.alla, max_sidor=args.max_sidor)
+    if args.med_pdf or args.bara_pdf:
+        synka_pdf(max_antal=args.max_pdf)
 
 
 if __name__ == "__main__":

@@ -570,8 +570,15 @@ def _skriv_pdf_cache(
     avgorande_id: str = None,
     filstorlek: int = None,
     filnamn: str = None,
+    kasta: bool = False,
 ):
-    """Lagrar extraherad PDF-text i cachen."""
+    """
+    Lagrar extraherad PDF-text i cachen.
+
+    Fel loggas och sväljs som standard: för hamta_pdf är cachen inte kritisk
+    för svaret. Synken anger kasta=True, eftersom en text som inte lagrats
+    ska hämtas om vid nästa körning i stället för att räknas som klar.
+    """
     try:
         conn = _hamta_db()
         cur = conn.cursor()
@@ -579,12 +586,17 @@ def _skriv_pdf_cache(
         nu = _nu_utc().isoformat()
 
         if _ar_postgres():
+            # avgorande_id och filnamn behåller ett tidigare värde om det nya
+            # saknas: hamta_pdf kan anropas utan dem.
             cur.execute("""
-                INSERT INTO rattspraxis.pdf_cache
+                INSERT INTO rattspraxis.pdf_cache AS pc
                     (fillagring_id, avgorande_id, text_md, hamtat, ttl_expires,
                      filstorlek_bytes, filnamn)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (fillagring_id) DO UPDATE SET
+                    avgorande_id = COALESCE(EXCLUDED.avgorande_id, pc.avgorande_id),
+                    filnamn = COALESCE(EXCLUDED.filnamn, pc.filnamn),
+                    filstorlek_bytes = EXCLUDED.filstorlek_bytes,
                     text_md = EXCLUDED.text_md,
                     hamtat = EXCLUDED.hamtat,
                     ttl_expires = EXCLUDED.ttl_expires
@@ -592,10 +604,17 @@ def _skriv_pdf_cache(
                   filstorlek, filnamn))
         else:
             cur.execute("""
-                INSERT OR REPLACE INTO pdf_cache
+                INSERT INTO pdf_cache
                     (fillagring_id, avgorande_id, text_md, hamtat, ttl_expires,
                      filstorlek_bytes, filnamn)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (fillagring_id) DO UPDATE SET
+                    avgorande_id = COALESCE(excluded.avgorande_id, pdf_cache.avgorande_id),
+                    filnamn = COALESCE(excluded.filnamn, pdf_cache.filnamn),
+                    filstorlek_bytes = excluded.filstorlek_bytes,
+                    text_md = excluded.text_md,
+                    hamtat = excluded.hamtat,
+                    ttl_expires = excluded.ttl_expires
             """, (fillagring_id, avgorande_id, text_md, nu, ttl.isoformat(),
                   filstorlek, filnamn))
 
@@ -603,4 +622,86 @@ def _skriv_pdf_cache(
         conn.close()
         log.info("PDF-text cachad: %s (%d tecken)", fillagring_id, len(text_md))
     except Exception as e:
+        if kasta:
+            raise
         log.warning("Fel vid skrivning till pdf_cache: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Publiceringar som bara finns som PDF
+# ---------------------------------------------------------------------------
+#
+# Domar och beslut från bland andra HD och MÖD saknar HTML-fulltext i API:et;
+# texten finns bara i PDF-bilagan. En sådan publicering räknas som
+# PDF-publicering, och den har text när någon av dess bilagor finns i
+# pdf_cache.
+
+def _pdf_bilagor_sql() -> str:
+    """Bilagor till lagrade publiceringar utan HTML-fulltext, en rad per bilaga."""
+    if _ar_postgres():
+        return """
+            SELECT ac.id AS avgorande_id, ac.avgorandedatum,
+                   b->>'fillagringId' AS fillagring_id, b->>'filnamn' AS filnamn
+            FROM rattspraxis.avgorande_cache ac
+            CROSS JOIN LATERAL jsonb_array_elements(
+                COALESCE(ac.data->'bilagaLista', '[]'::jsonb)) AS b
+            WHERE COALESCE(ac.data->>'innehall', '') = ''
+              AND COALESCE(b->>'fillagringId', '') <> ''
+        """
+    return """
+        SELECT ac.id AS avgorande_id, ac.avgorandedatum,
+               json_extract(b.value, '$.fillagringId') AS fillagring_id,
+               json_extract(b.value, '$.filnamn') AS filnamn
+        FROM avgorande_cache ac, json_each(ac.data, '$.bilagaLista') AS b
+        WHERE COALESCE(json_extract(ac.data, '$.innehall'), '') = ''
+          AND COALESCE(json_extract(b.value, '$.fillagringId'), '') <> ''
+    """
+
+
+def pdf_att_hamta(max_antal: int | None = None) -> list[dict]:
+    """
+    PDF-bilagor som saknar text i pdf_cache, nyaste avgörandet först.
+
+    Utgången TTL spelar ingen roll här: en lagrad text räknas som hämtad, och
+    sok_i_domtext söker i den oavsett ålder.
+    """
+    sql = f"""
+        SELECT x.avgorande_id, x.fillagring_id, x.filnamn
+        FROM ({_pdf_bilagor_sql()}) x
+        WHERE NOT EXISTS (
+            SELECT 1 FROM {_prefix()}pdf_cache pc WHERE pc.fillagring_id = x.fillagring_id
+        )
+        ORDER BY x.avgorandedatum DESC, x.fillagring_id
+    """
+    if max_antal is not None:
+        sql += f" LIMIT {int(max_antal)}"
+    conn = _hamta_db()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql)
+        rader = cur.fetchall()
+    finally:
+        conn.close()
+    return [
+        {"avgorande_id": r[0], "fillagring_id": r[1], "filnamn": r[2]}
+        for r in rader
+    ]
+
+
+def rakna_pdf_tackning() -> dict:
+    """Antal PDF-publiceringar och hur många av dem som har text i pdf_cache."""
+    sql = f"""
+        SELECT COUNT(DISTINCT x.avgorande_id),
+               COUNT(DISTINCT CASE WHEN pc.fillagring_id IS NOT NULL
+                                   THEN x.avgorande_id END)
+        FROM ({_pdf_bilagor_sql()}) x
+        LEFT JOIN {_prefix()}pdf_cache pc ON pc.fillagring_id = x.fillagring_id
+    """
+    conn = _hamta_db()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql)
+        totalt, med_text = cur.fetchone()
+    finally:
+        conn.close()
+    return {"pdf_publiceringar": int(totalt or 0), "pdf_publiceringar_med_text": int(med_text or 0)}

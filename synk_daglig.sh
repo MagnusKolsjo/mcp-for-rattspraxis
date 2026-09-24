@@ -44,4 +44,10 @@ echo "[$(date '+%H:%M:%S')] Steg 1: publiceringar"
     exit 1
 }
 
+echo "[$(date '+%H:%M:%S')] Steg 2: PDF-texter"
+"$PYTHON" "$SERVER_DIR/01_synka_publiceringar.py" --bara-pdf || {
+    echo "[$(date '+%H:%M:%S')] Steg 2 felade — avbryter"
+    exit 1
+}
+
 echo "===== $(date '+%Y-%m-%d %H:%M:%S') — daglig synk klar ====="
