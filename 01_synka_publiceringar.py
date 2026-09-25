@@ -237,7 +237,10 @@ def synka_pdf(max_antal: int | None = None) -> int:
             fid = bilaga["fillagring_id"]
             try:
                 pdf_bytes = _hamta_bilaga(fid)
-                text = pdftext.extrahera_text(pdf_bytes)
+                text = pdftext.extrahera_text(
+                    pdf_bytes, kalla_id=fid,
+                    kalla_url=f"{klient.API_BAS}/bilagor/{fid}",
+                )
             except (klient.AvgorandeSaknas, pdftext.PdfFel) as e:
                 log.warning("Hoppar över %s: %s", fid, e)
                 hoppade.append(fid)

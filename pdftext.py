@@ -4,79 +4,57 @@ Textextraktion ur Domstolsverkets PDF-bilagor.
 
 Används av både MCP-servern (hamta_pdf) och synkskriptet, så att texten som
 lagras i pdf_cache blir densamma oavsett vem som hämtade PDF:en.
+
+Själva extraktionen sker i pdftext_skydd.extrahera_pdf, som kör den i en
+egen process under minnes- och tidsvakt och sätter rätt OCR-språk. Se den
+modulens dokumentation för miljövariablerna som styr vakten och OCR-kön
+(RP_OCR_SPRAK, RP_PDF_MAX_MINNE_MB, RP_PDF_TIDSGRANS_S, RP_PDF_SIDBLOCK,
+RP_OCR_KO_MAPP).
 """
 
-import contextlib
 import logging
-import os
 import threading
-from pathlib import Path
+
+from pdftext_skydd import extrahera_pdf
 
 log = logging.getLogger(__name__)
 
-_LOGS_DIR = Path(__file__).parent.resolve() / "logs"
+# Miljövariabelprefix och standardspråk för extrahera_pdf.
+PREFIX = "RP"
+STANDARDSPRAK = "swe+eng"
 
 # PyMuPDF är inte trådsäkert, och MCP-verktygen körs på arbetstrådar. Låset
-# serialiserar extraktionen. Det skyddar också _tysta_fd1, som flyttar
-# processens gemensamma filhandtag: två samtidiga omdirigeringar skulle
-# återställa handtagen i fel ordning.
+# serialiserar extraktionen.
 _pdf_las = threading.Lock()
 
 
 class PdfFel(RuntimeError):
-    """PDF:en gick inte att läsa, eller pymupdf4llm saknas."""
+    """PDF:en gick inte att läsa."""
 
 
-@contextlib.contextmanager
-def _tysta_fd1():
+def extrahera_text(pdf_bytes: bytes, *, kalla_id: str, kalla_url: str = "") -> str:
     """
-    Redirigerar FD 1 och FD 2 till loggfil under anrop som skriver direkt
-    till filhandtagen (pymupdf4llm och dess C-bindningar).
+    Extraherar PDF:ens text som markdown. Kastar PdfFel om det inte går.
 
-    MCP-protokollet skyddas redan av SDK:ns stdio-transport, som läser och
-    skriver på egna kopior av handtagen. Omdirigeringen håller i stället
-    extraktionens utskrifter borta från stderr, som klienten loggar.
-    Anropas bara med _pdf_las taget.
+    kalla_id och kalla_url identifierar dokumentet i OCR-kön (ocr_ko/ko.jsonl)
+    om någon sida saknar textlager eller om ett sidblock fick läsas med ren
+    textutvinning.
     """
-    _LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    logg = _LOGS_DIR / "subprocess.log"
-    spara_ut = os.dup(1)
-    spara_fel = os.dup(2)
-    fd = os.open(str(logg), os.O_WRONLY | os.O_APPEND | os.O_CREAT)
-    try:
-        os.dup2(fd, 1)
-        os.dup2(fd, 2)
-        yield
-    finally:
-        os.dup2(spara_ut, 1)
-        os.dup2(spara_fel, 2)
-        os.close(spara_ut)
-        os.close(spara_fel)
-        os.close(fd)
-
-
-def extrahera_text(pdf_bytes: bytes) -> str:
-    """Extraherar PDF:ens text som markdown. Kastar PdfFel om det inte går."""
-    # pymupdf4llm importeras först här — det krävs bara när en PDF läses.
-    try:
-        import fitz
-        import pymupdf4llm
-    except ImportError as e:
-        raise PdfFel(
-            "pymupdf4llm är inte installerat. Kör: pip install pymupdf4llm "
-            "och starta om servern."
-        ) from e
-
     try:
         with _pdf_las:
-            dok = fitz.open(stream=pdf_bytes, filetype="pdf")
-            try:
-                with _tysta_fd1():
-                    return pymupdf4llm.to_markdown(dok)
-            finally:
-                dok.close()
+            resultat = extrahera_pdf(
+                pdf_bytes, prefix=PREFIX, standardsprak=STANDARDSPRAK,
+                kalla_id=kalla_id, kalla_url=kalla_url,
+            )
     except Exception as e:
         raise PdfFel(
             f"Texten i PDF:en kunde inte extraheras ({e}). Filen kan vara "
             "skadad eller bara innehålla inskannade bilder."
         ) from e
+
+    if resultat.i_ocr_ko:
+        log.info(
+            "PDF %s lagd i OCR-kön (metod=%s, sidor utan textlager=%s): %s",
+            kalla_id, resultat.metod, resultat.sidor_utan_textlager, resultat.orsak,
+        )
+    return resultat.text

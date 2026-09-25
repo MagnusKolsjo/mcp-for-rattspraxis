@@ -779,7 +779,10 @@ def hamta_pdf(
         pdf_bytes = klient.hamta_bilaga(fillagring_id)
 
     try:
-        markdown_text = pdftext.extrahera_text(pdf_bytes)
+        markdown_text = pdftext.extrahera_text(
+            pdf_bytes, kalla_id=fillagring_id,
+            kalla_url=f"{klient.API_BAS}/bilagor/{fillagring_id}",
+        )
     except pdftext.PdfFel as e:
         log.error("Fel vid PDF-extraktion av %s: %s", fillagring_id, e)
         raise ToolError(f"PDF:en '{fillagring_id}': {e}") from e
