@@ -87,6 +87,12 @@ Med `--med-pdf` följer ett andra steg (`--bara-pdf` kör bara det): PDF-bilagor
 
 Publiceringar som ändras hos källan utan att få en ny publiceringstid fångas inte av den inkrementella synken. De uppdateras när cachens TTL gått ut och avgörandet hämtas på nytt, eller vid en ny fullsynk med `--alla`. Efter en fullsynk jämför skriptet antalet lokala avgöranden med källans totalsiffra och loggar om några saknas.
 
+## PDF-extraktion: OCR-språk, minnesvakt och OCR-kö
+
+`hamta_pdf` och PDF-steget i synken extraherar text med `pdftext_skydd.py`. PDF:en läses blockvis (`RP_PDF_SIDBLOCK`, standard 20 sidor) i en egen process, med en vakt i föräldraprocessen som avbryter blocket om det passerar minnesgränsen (`RP_PDF_MAX_MINNE_MB`, standard 3000 MB) eller tidsgränsen (`RP_PDF_TIDSGRANS_S`, standard 300 s). Ett enskilt bildtungt dokument kan då aldrig fälla servern. OCR-språket sätts uttryckligen till `swe+eng` (`RP_OCR_SPRAK`), eftersom pymupdf4llm annars OCR:ar på engelska och svenska tecken (å, ä, ö) blir fel.
+
+Ett block som passerar någon gräns läses i stället om med ren textutvinning (utan layout och OCR), så att dokumentet ändå blir sökbart. Dokument där någon sida saknar textlager, eller där ett block fick läsas med ren textutvinning, noteras i en OCR-kö (`RP_OCR_KO_MAPP`, standard `ocr_ko/` bredvid `pdftext_skydd.py`): `ocr_ko/ko.jsonl` listar posterna och `ocr_ko/filer/` innehåller PDF:erna. Köade dokument kan köras genom en bättre OCR senare utan att laddas ned igen.
+
 ## Databasschema
 
 Servern skapar automatiskt schemat `rattspraxis` i din PostgreSQL-databas (eller tabellerna direkt om SQLite används) vid uppstart, och lägger till nya kolumner och tabeller i befintliga databaser:

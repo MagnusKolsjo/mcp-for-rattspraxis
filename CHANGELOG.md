@@ -7,6 +7,16 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 
 ### Tillagt
 
+- **Minnesvakt, sidblock och OCR-kö i PDF-extraktionen.** `pdftext.py` extraherar nu
+  via `pdftext_skydd.py`: varje PDF läses blockvis (`RP_PDF_SIDBLOCK`, standard 20
+  sidor) i en egen process, med en vakt i föräldraprocessen som avbryter blocket om
+  det passerar en minnesgräns (`RP_PDF_MAX_MINNE_MB`, standard 3000 MB) eller
+  tidsgräns (`RP_PDF_TIDSGRANS_S`, standard 300 s) — en enskild bildtung PDF kan då
+  inte längre fälla processen. Ett block som passerar gränsen läses i stället med ren
+  textutvinning. Dokument där någon sida saknar textlager, eller där ett block fick
+  läsas med ren textutvinning, noteras i en OCR-kö (`ocr_ko/ko.jsonl` +
+  `ocr_ko/filer/`, mapp konfigurerbar med `RP_OCR_KO_MAPP`) för att köras genom en
+  bättre OCR senare.
 - **Daglig synk av hela korpusen.** `01_synka_publiceringar.py` hämtar Domstolsverkets
   publiceringar via `GET /publiceringar` (sorterat på publiceringstid, med
   `publicerad_fran_och_med` och sidindelning) och lagrar dem i `avgorande_cache`.
@@ -65,6 +75,9 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 
 ### Rättat
 
+- **OCR-språket i PDF-extraktionen var engelska.** `pymupdf4llm` OCR:ar sidor utan
+  textlager på engelska om inget annat anges, vilket gav felaktiga tecken i svensk
+  text. `pdftext.py` anger nu uttryckligen `swe+eng` (`RP_OCR_SPRAK`).
 - Läs vidare-raden i ett kapat svar från `hamta_pdf` pekade på
   `fran_tecken + max_tecken`. Kapningen sker på ordgräns, så nästa utdrag hoppade
   över det avkapade ordet, och med `fran_tecken` nära slutet pekade raden bortom
@@ -87,6 +100,9 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 
 ### Borttaget
 
+- `pdftext.py`s egna fd-omdirigering (`_tysta_fd1`) kring PDF-extraktionen.
+  Extraktionen körs nu i en egen process i `pdftext_skydd.py`, så den behövs inte
+  längre för att hålla `pymupdf4llm`s utskrifter borta från stderr.
 - Den egna Starlette-appen för http-läget; transporten sköts av `mcp_transport.py`.
 - `starlette` och `uvicorn` som egna rader i `requirements.txt` (de följer med `mcp`).
 
