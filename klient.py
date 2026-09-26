@@ -22,7 +22,7 @@ API_BAS = "https://rattspraxis.etjanst.domstol.se/api/v1"
 
 # Projektidentifierande User-Agent. Skickas med på alla anrop mot källan.
 HEADERS = {
-    "User-Agent": "mcp-for-rattspraxis/1.0 (+https://github.com/MagnusKolsjo/mcp-for-rattspraxis)",
+    "User-Agent": "mcp-for-rattspraxis/2.0 (+https://github.com/MagnusKolsjo/mcp-for-rattspraxis)",
 }
 
 # GET /publiceringar returnerar högst 100 publiceringar per sida, även om

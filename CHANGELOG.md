@@ -5,6 +5,8 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0] — 2026-09-26
+
 ### Tillagt
 
 - **Minnesvakt, sidblock och OCR-kö i PDF-extraktionen.** `pdftext.py` extraherar nu
@@ -53,6 +55,7 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 
 ### Ändrat
 
+- User-Agent-strängen följer huvudversionen: `mcp-for-rattspraxis/2.0`.
 - **Brytande:** servern kräver `mcp>=2.0,<3` och bygger på `MCPServer`.
 - **Brytande:** http-läget kräver `MCP_API_KEY`. Utan nyckel startar servern inte
   (exitkod 2); tidigare startade den utan autentisering med en varning. Fel nyckel ger
