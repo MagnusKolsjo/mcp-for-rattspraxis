@@ -55,6 +55,7 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 
 ### Ändrat
 
+- Texterna är produktneutrala: README, konfigurationsexempel, kommentarer och äldre CHANGELOG-poster nämner MCP-klienten i stället för en viss klient.
 - User-Agent-strängen följer huvudversionen: `mcp-for-rattspraxis/2.0`.
 - **Brytande:** servern kräver `mcp>=2.0,<3` och bygger på `MCPServer`.
 - **Brytande:** http-läget kräver `MCP_API_KEY`. Utan nyckel startar servern inte
