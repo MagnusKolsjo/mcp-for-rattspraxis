@@ -5,6 +5,14 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixat
+
+- onnxruntime, som `pymupdf4llm` laddar för layout och OCR, skickade som standard användningsdata
+  till Microsoft (`mobile.events.data.microsoft.com`) utan att användaren tillfrågats. Telemetrin
+  stängs nu av i PDF-extraktionens barnprocess (`ORT_DISABLE_TELEMETRY=1` och
+  `disable_telemetry_events()`) innan biblioteket laddas. Det tar också bort en krasch (SIGABRT)
+  i telemetrins nedstängning när barnprocessen avslutades.
+
 ## [2.0.0] — 2026-09-26
 
 ### Tillagt
