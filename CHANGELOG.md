@@ -5,6 +5,8 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.1] — 2026-10-06
+
 ### Fixat
 
 - onnxruntime, som `pymupdf4llm` laddar för layout och OCR, skickade som standard användningsdata
